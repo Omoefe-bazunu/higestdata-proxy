@@ -107,16 +107,17 @@ app.get("/variations/tv", async (req, res) => {
 });
 
 // Verify customer
-app.get("/verify-customer", async (req, res) => {
+app.post("/verify-customer", async (req, res) => {
   try {
     if (!token) await getAccessToken();
 
-    const { service_id, customer_id, variation_id } = req.query;
-    let url = `${EBILLS_API_URL}verify-customer?service_id=${service_id}&customer_id=${customer_id}`;
-    if (variation_id) url += `&variation_id=${variation_id}`;
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
+    const response = await fetch(`${EBILLS_API_URL}verify-customer`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(req.body),
     });
 
     const data = await response.json();
