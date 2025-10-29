@@ -106,6 +106,26 @@ app.get("/variations/tv", async (req, res) => {
   }
 });
 
+// Verify customer
+app.get("/verify-customer", async (req, res) => {
+  try {
+    if (!token) await getAccessToken();
+
+    const { service_id, customer_id, variation_id } = req.query;
+    let url = `${EBILLS_API_URL}verify-customer?service_id=${service_id}&customer_id=${customer_id}`;
+    if (variation_id) url += `&variation_id=${variation_id}`;
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Airtime purchase
 app.post("/airtime", async (req, res) => {
   try {
@@ -190,7 +210,7 @@ app.post("/electricity", async (req, res) => {
   }
 });
 
-// Betting purchase
+// Betting funding
 app.post("/betting", async (req, res) => {
   try {
     if (!token) await getAccessToken();
@@ -202,26 +222,6 @@ app.post("/betting", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(req.body),
-    });
-
-    const data = await response.json();
-    res.status(response.status).json(data);
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Verify customer
-app.get("/verify-customer", async (req, res) => {
-  try {
-    if (!token) await getAccessToken();
-
-    const { service_id, customer_id, variation_id } = req.query;
-    let url = `${EBILLS_API_URL}verify-customer?service_id=${service_id}&customer_id=${customer_id}`;
-    if (variation_id) url += `&variation_id=${variation_id}`;
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
     });
 
     const data = await response.json();
