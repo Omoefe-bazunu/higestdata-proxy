@@ -232,6 +232,8 @@ app.post("/betting", async (req, res) => {
   }
 });
 
+// PAYSTACK FUNDING & WITHDRAWAL
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Proxy server running on port ${PORT}`);
 });
