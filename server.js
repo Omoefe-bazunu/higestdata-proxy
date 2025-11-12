@@ -1,4 +1,4 @@
-// server.js
+// server.js - FIXED VERSION
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -67,6 +67,46 @@ async function verifyFirebaseToken(idToken) {
   } catch (err) {
     throw new Error("Invalid Firebase token");
   }
+}
+
+// === HELPER: Map eBills status/message to internal status ===
+function mapEBillsStatus(apiResponse) {
+  const status = apiResponse.data?.status;
+  const message = apiResponse.message;
+
+  // Completed states
+  if (status === "completed-api" || message === "ORDER COMPLETED") {
+    return { status: "success", shouldDeductWallet: true };
+  }
+
+  // Processing states (valid, not errors)
+  if (
+    message === "ORDER PROCESSING" ||
+    message === "ORDER QUEUED" ||
+    message === "ORDER INITIATED" ||
+    message === "ORDER PENDING" ||
+    status === "processing-api" ||
+    status === "queued-api" ||
+    status === "initiated-api" ||
+    status === "pending"
+  ) {
+    return { status: "pending", shouldDeductWallet: false };
+  }
+
+  // Failed states
+  if (
+    message === "ORDER FAILED" ||
+    message === "ORDER REFUNDED" ||
+    message === "ORDER CANCELLED" ||
+    status === "failed" ||
+    status === "refunded" ||
+    status === "cancelled"
+  ) {
+    return { status: "failed", shouldDeductWallet: false };
+  }
+
+  // Default to pending for unknown states
+  return { status: "pending", shouldDeductWallet: false };
 }
 
 // === FETCH RATES ===
@@ -195,7 +235,7 @@ app.get("/api/betting/verify", async (req, res) => {
   }
 });
 
-// === TRANSACTION (Airtime, Data, Cable) ===
+// === TRANSACTION (Airtime, Data, Cable) - FIXED ===
 app.post("/api/vtu/transaction", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -262,11 +302,19 @@ app.post("/api/vtu/transaction", async (req, res) => {
       return res.status(400).json({ error: "Invalid service type" });
     }
 
-    if (!apiResponse.success) {
-      return res.status(400).json({ error: apiResponse.message });
+    console.log("eBills API Response:", JSON.stringify(apiResponse, null, 2));
+
+    // FIXED: Check if API call itself failed
+    if (apiResponse.code !== "success") {
+      return res.status(400).json({
+        error: apiResponse.message || "Transaction failed at eBills",
+      });
     }
 
-    const isCompleted = apiResponse.data.status === "completed-api";
+    // Map the status correctly
+    const { status: txnStatus, shouldDeductWallet } =
+      mapEBillsStatus(apiResponse);
+
     const txnData = {
       userId,
       transactionId,
@@ -274,7 +322,7 @@ app.post("/api/vtu/transaction", async (req, res) => {
       description: `${serviceType} - ${network || customerId}`,
       amount: finalPrice,
       type: "debit",
-      status: isCompleted ? "success" : "pending",
+      status: txnStatus,
       phone,
       network,
       variationId,
@@ -283,7 +331,7 @@ app.post("/api/vtu/transaction", async (req, res) => {
       ebillsAmount: amount,
       eBillsResponse: apiResponse,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !isCompleted,
+      pending: !shouldDeductWallet, // Only completed transactions are not pending
     };
 
     const userTxnRef = db
@@ -291,9 +339,11 @@ app.post("/api/vtu/transaction", async (req, res) => {
       .doc(userId)
       .collection("transactions")
       .doc(transactionId);
+
     await userTxnRef.set(txnData);
 
-    if (isCompleted) {
+    // FIXED: Only deduct wallet if transaction is immediately completed
+    if (shouldDeductWallet) {
       await db
         .collection("users")
         .doc(userId)
@@ -305,7 +355,10 @@ app.post("/api/vtu/transaction", async (req, res) => {
     res.json({
       success: true,
       transactionId,
-      message: isCompleted ? "completed" : "processing",
+      message: shouldDeductWallet
+        ? "Transaction completed"
+        : "Transaction is being processed",
+      status: txnStatus,
       transactionData: txnData,
     });
   } catch (error) {
@@ -401,13 +454,16 @@ app.post("/api/electricity/purchase", async (req, res) => {
       variationId,
       electricityAmount
     );
-    if (!ebillsResponse || ebillsResponse.code !== "success") {
+
+    if (ebillsResponse.code !== "success") {
       return res
         .status(400)
         .json({ error: ebillsResponse?.message || "eBills failed" });
     }
 
-    const isCompleted = ebillsResponse.data.status === "completed-api";
+    const { status: txnStatus, shouldDeductWallet } =
+      mapEBillsStatus(ebillsResponse);
+
     const txnData = {
       userId,
       transactionId,
@@ -415,7 +471,7 @@ app.post("/api/electricity/purchase", async (req, res) => {
       description: `Electricity - ${provider}`,
       amount: total,
       type: "debit",
-      status: isCompleted ? "success" : "pending",
+      status: txnStatus,
       serviceType: "electricity",
       provider,
       customerId,
@@ -426,7 +482,7 @@ app.post("/api/electricity/purchase", async (req, res) => {
       customerName: customerData.customer_name,
       customerAddress: customerData.customer_address,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !isCompleted,
+      pending: !shouldDeductWallet,
     };
 
     await db
@@ -435,7 +491,8 @@ app.post("/api/electricity/purchase", async (req, res) => {
       .collection("transactions")
       .doc(transactionId)
       .set(txnData);
-    if (isCompleted) {
+
+    if (shouldDeductWallet) {
       await db
         .collection("users")
         .doc(userId)
@@ -516,11 +573,15 @@ app.post("/api/betting/fund", async (req, res) => {
       provider,
       bettingAmount
     );
-    if (!ebillsResponse || ebillsResponse.code !== "success") {
+
+    if (ebillsResponse.code !== "success") {
       return res
         .status(400)
         .json({ error: ebillsResponse?.message || "eBills failed" });
     }
+
+    const { status: txnStatus, shouldDeductWallet } =
+      mapEBillsStatus(ebillsResponse);
 
     const txnData = {
       userId,
@@ -529,7 +590,7 @@ app.post("/api/betting/fund", async (req, res) => {
       description: `Betting - ${provider}`,
       amount: total,
       type: "debit",
-      status: "success",
+      status: txnStatus,
       serviceType: "betting",
       provider,
       customerId,
@@ -538,6 +599,7 @@ app.post("/api/betting/fund", async (req, res) => {
       ebillsResponse,
       customerName: customerData.customer_name || customerId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      pending: !shouldDeductWallet,
     };
 
     await db
@@ -546,12 +608,15 @@ app.post("/api/betting/fund", async (req, res) => {
       .collection("transactions")
       .doc(transactionId)
       .set(txnData);
-    await db
-      .collection("users")
-      .doc(userId)
-      .update({
-        walletBalance: admin.firestore.FieldValue.increment(-total),
-      });
+
+    if (shouldDeductWallet) {
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-total),
+        });
+    }
 
     res.json({ success: true, transactionId, transactionData: txnData });
   } catch (error) {
@@ -560,7 +625,7 @@ app.post("/api/betting/fund", async (req, res) => {
   }
 });
 
-// === WEBHOOK (Handles ALL services) ===
+// === WEBHOOK (FIXED) - Handles ALL services ===
 app.post("/webhook", async (req, res) => {
   const signature = req.headers["x-signature"];
   const payload = req.rawBody.toString();
@@ -574,14 +639,19 @@ app.post("/webhook", async (req, res) => {
     return res.status(403).json({ error: "Invalid signature" });
   }
 
-  const { request_id, status } = req.body;
+  const { request_id, status, order_id } = req.body;
 
   if (!request_id) {
     console.log("Webhook missing request_id:", req.body);
     return res.status(400).json({ error: "Missing request_id" });
   }
 
-  console.log("WEBHOOK RECEIVED:", { request_id, status });
+  console.log("WEBHOOK RECEIVED:", {
+    request_id,
+    status,
+    order_id,
+    fullBody: req.body,
+  });
 
   try {
     const snapshot = await db
@@ -592,7 +662,7 @@ app.post("/webhook", async (req, res) => {
 
     if (snapshot.empty) {
       console.log("No pending transaction found for request_id:", request_id);
-      return res.json({ status: "ignored" });
+      return res.json({ status: "ignored - no pending transaction" });
     }
 
     const batch = db.batch();
@@ -602,14 +672,33 @@ app.post("/webhook", async (req, res) => {
       const txnRef = doc.ref;
       const userRef = db.collection("users").doc(data.userId);
 
-      // SUPPORT ALL eBills SUCCESS STATES
+      // FIXED: Comprehensive status mapping
       const isSuccess =
         status === "completed-api" ||
         status === "ORDER COMPLETED" ||
+        status === "completed" ||
         status === "success";
 
       const isFailed =
-        status === "failed" || status === "refunded" || status === "error";
+        status === "failed" ||
+        status === "refunded" ||
+        status === "ORDER FAILED" ||
+        status === "ORDER REFUNDED" ||
+        status === "ORDER CANCELLED" ||
+        status === "cancelled" ||
+        status === "error";
+
+      const isPending =
+        status === "ORDER PROCESSING" ||
+        status === "ORDER QUEUED" ||
+        status === "ORDER INITIATED" ||
+        status === "ORDER PENDING" ||
+        status === "ORDER ON-HOLD" ||
+        status === "processing-api" ||
+        status === "queued-api" ||
+        status === "initiated-api" ||
+        status === "pending" ||
+        status === "on-hold";
 
       if (isSuccess) {
         batch.update(txnRef, {
@@ -617,22 +706,31 @@ app.post("/webhook", async (req, res) => {
           pending: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        // Deduct wallet on success
         batch.update(userRef, {
           walletBalance: admin.firestore.FieldValue.increment(-data.amount),
         });
-        console.log(`Wallet deducted: ₦${data.amount} for ${data.userId}`);
+        console.log(
+          `✅ SUCCESS: Wallet deducted ₦${data.amount} for ${data.userId}`
+        );
       } else if (isFailed) {
         batch.update(txnRef, {
           status: "failed",
           pending: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        // Optional: Refund wallet
-        batch.update(userRef, {
-          walletBalance: admin.firestore.FieldValue.increment(data.amount),
+        console.log(`❌ FAILED: Transaction ${request_id} marked as failed`);
+        // No wallet deduction for failed transactions
+      } else if (isPending) {
+        // Keep as pending, don't deduct wallet yet
+        batch.update(txnRef, {
+          status: "pending",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        console.log(`⏳ PENDING: Transaction ${request_id} still processing`);
       } else {
-        // Unknown status → mark pending
+        // Unknown status - log and keep pending
+        console.log(`⚠️ UNKNOWN STATUS: ${status} for ${request_id}`);
         batch.update(txnRef, {
           status: status || "pending",
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -641,10 +739,10 @@ app.post("/webhook", async (req, res) => {
     });
 
     await batch.commit();
-    console.log("Webhook processed successfully");
+    console.log("✅ Webhook processed successfully");
     res.json({ status: "success" });
   } catch (error) {
-    console.error("Webhook error:", error);
+    console.error("❌ Webhook error:", error);
     res.status(500).json({ error: "Failed" });
   }
 });
