@@ -69,6 +69,13 @@ async function verifyFirebaseToken(idToken) {
   }
 }
 
+// === HELPER: Remove undefined values from object ===
+function cleanObject(obj) {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([_, v]) => v !== undefined)
+  );
+}
+
 // === HELPER: Map eBills status/message to internal status ===
 function mapEBillsStatus(apiResponse) {
   const status = apiResponse.data?.status;
@@ -315,6 +322,7 @@ app.post("/api/vtu/transaction", async (req, res) => {
     const { status: txnStatus, shouldDeductWallet } =
       mapEBillsStatus(apiResponse);
 
+    // FIXED: Build transaction data without undefined values
     const txnData = {
       userId,
       transactionId,
@@ -323,16 +331,18 @@ app.post("/api/vtu/transaction", async (req, res) => {
       amount: finalPrice,
       type: "debit",
       status: txnStatus,
-      phone,
-      network,
-      variationId,
-      customerId,
       serviceType,
       ebillsAmount: amount,
       eBillsResponse: apiResponse,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !shouldDeductWallet, // Only completed transactions are not pending
+      pending: !shouldDeductWallet,
     };
+
+    // Add optional fields only if they exist
+    if (phone) txnData.phone = phone;
+    if (network) txnData.network = network;
+    if (variationId) txnData.variationId = variationId;
+    if (customerId) txnData.customerId = customerId;
 
     const userTxnRef = db
       .collection("users")
@@ -340,7 +350,8 @@ app.post("/api/vtu/transaction", async (req, res) => {
       .collection("transactions")
       .doc(transactionId);
 
-    await userTxnRef.set(txnData);
+    // Clean object to remove undefined values before saving
+    await userTxnRef.set(cleanObject(txnData));
 
     // FIXED: Only deduct wallet if transaction is immediately completed
     if (shouldDeductWallet) {
@@ -490,7 +501,7 @@ app.post("/api/electricity/purchase", async (req, res) => {
       .doc(userId)
       .collection("transactions")
       .doc(transactionId)
-      .set(txnData);
+      .set(cleanObject(txnData));
 
     if (shouldDeductWallet) {
       await db
