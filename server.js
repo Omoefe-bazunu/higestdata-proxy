@@ -153,12 +153,10 @@ app.get("/api/electricity/verify", async (req, res) => {
   try {
     const { service_id, customer_id, variation_id } = req.query;
     if (!service_id || !customer_id || !variation_id) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Missing service_id, customer_id, or variation_id",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Missing service_id, customer_id, or variation_id",
+      });
     }
     const data = await verifyCustomer(service_id, customer_id, variation_id);
     res.json(
@@ -571,11 +569,19 @@ app.post("/webhook", async (req, res) => {
     .update(payload)
     .digest("hex");
 
-  if (hash !== signature)
+  if (hash !== signature) {
+    console.log("Invalid webhook signature");
     return res.status(403).json({ error: "Invalid signature" });
+  }
 
   const { request_id, status } = req.body;
-  if (!request_id) return res.status(400).json({ error: "Missing request_id" });
+
+  if (!request_id) {
+    console.log("Webhook missing request_id:", req.body);
+    return res.status(400).json({ error: "Missing request_id" });
+  }
+
+  console.log("WEBHOOK RECEIVED:", { request_id, status });
 
   try {
     const snapshot = await db
@@ -584,7 +590,10 @@ app.post("/webhook", async (req, res) => {
       .where("pending", "==", true)
       .get();
 
-    if (snapshot.empty) return res.json({ status: "ignored" });
+    if (snapshot.empty) {
+      console.log("No pending transaction found for request_id:", request_id);
+      return res.json({ status: "ignored" });
+    }
 
     const batch = db.batch();
 
@@ -593,7 +602,16 @@ app.post("/webhook", async (req, res) => {
       const txnRef = doc.ref;
       const userRef = db.collection("users").doc(data.userId);
 
-      if (status === "completed-api") {
+      // SUPPORT ALL eBills SUCCESS STATES
+      const isSuccess =
+        status === "completed-api" ||
+        status === "ORDER COMPLETED" ||
+        status === "success";
+
+      const isFailed =
+        status === "failed" || status === "refunded" || status === "error";
+
+      if (isSuccess) {
         batch.update(txnRef, {
           status: "success",
           pending: false,
@@ -602,19 +620,28 @@ app.post("/webhook", async (req, res) => {
         batch.update(userRef, {
           walletBalance: admin.firestore.FieldValue.increment(-data.amount),
         });
-      } else if (status === "refunded") {
+        console.log(`Wallet deducted: ₦${data.amount} for ${data.userId}`);
+      } else if (isFailed) {
         batch.update(txnRef, {
-          status: "refunded",
+          status: "failed",
           pending: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        // Optional: Refund wallet
         batch.update(userRef, {
           walletBalance: admin.firestore.FieldValue.increment(data.amount),
+        });
+      } else {
+        // Unknown status → mark pending
+        batch.update(txnRef, {
+          status: status || "pending",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
     });
 
     await batch.commit();
+    console.log("Webhook processed successfully");
     res.json({ status: "success" });
   } catch (error) {
     console.error("Webhook error:", error);
@@ -731,12 +758,18 @@ async function buyTv({ customerId, provider, variationId, requestId }) {
   return res.json();
 }
 
+// === eBILLS BALANCE CHECK ===
 async function getBalance() {
-  const res = await fetch(`${EBILLS_API_URL}balance`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const data = await res.json();
-  return data.data?.balance || 0;
+  try {
+    const res = await fetch(`${EBILLS_API_URL}balance`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    return data.data?.balance || 0;
+  } catch (error) {
+    console.error("Balance check failed:", error);
+    return 0;
+  }
 }
 
 // === START ===
