@@ -881,6 +881,120 @@ async function getBalance() {
   }
 }
 
+// Add this new endpoint to your server.js
+
+// === PROCESS WITHDRAWAL (Admin Action) ===
+app.post("/api/withdrawal/process", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+  let adminUserId;
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    adminUserId = decodedToken.uid;
+    if (decodedToken.email !== "highestdatafintechsolutions@gmail.com") {
+      return res
+        .status(403)
+        .json({ error: "Forbidden: Admin access required" });
+    }
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { requestId, action } = req.body;
+  if (!requestId || !["complete", "reject"].includes(action)) {
+    return res.status(400).json({ error: "Invalid request parameters" });
+  }
+
+  try {
+    const withdrawalRef = db.collection("withdrawalRequests").doc(requestId);
+    const withdrawalSnap = await withdrawalRef.get();
+    if (!withdrawalSnap.exists)
+      return res.status(404).json({ error: "Withdrawal request not found" });
+
+    const withdrawalData = withdrawalSnap.data();
+    if (withdrawalData.status !== "pending")
+      return res.status(400).json({ error: "Withdrawal already processed" });
+
+    const newStatus = action === "complete" ? "completed" : "failed";
+    const userRef = db.collection("users").doc(withdrawalData.userId);
+
+    await db.runTransaction(async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      if (!userSnap.exists) throw new Error("User not found");
+      const currentBalance = userSnap.data().walletBalance || 0;
+      let newBalance = currentBalance;
+
+      if (action === "complete") {
+        if (currentBalance < withdrawalData.totalAmount) {
+          throw new Error("Insufficient balance");
+        }
+        newBalance = currentBalance - withdrawalData.totalAmount;
+      }
+      // REJECT: No wallet change
+
+      transaction.update(withdrawalRef, {
+        status: newStatus,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        processedBy: adminUserId,
+      });
+
+      transaction.update(userRef, { walletBalance: newBalance });
+
+      const txQuery = await db
+        .collection("users")
+        .doc(withdrawalData.userId)
+        .collection("transactions")
+        .where("reference", "==", withdrawalData.reference)
+        .get();
+
+      txQuery.docs.forEach((txDoc) => {
+        transaction.update(txDoc.ref, {
+          status: newStatus,
+          processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+    });
+
+    try {
+      await fetch(
+        `${
+          process.env.BASE_URL || "http://localhost:3000"
+        }/api/withdrawal/notify-user`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: withdrawalData.userEmail,
+            userName: withdrawalData.userName,
+            amount: withdrawalData.amount,
+            status: newStatus,
+            reference: withdrawalData.reference,
+            bankName: withdrawalData.bankName,
+            accountNumber: withdrawalData.accountNumber,
+          }),
+        }
+      );
+    } catch (emailError) {
+      console.error("Email failed:", emailError);
+    }
+
+    res.json({
+      success: true,
+      message: `Withdrawal ${newStatus}`,
+      withdrawalId: requestId,
+      status: newStatus,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res
+      .status(500)
+      .json({ error: error.message || "Failed to process withdrawal" });
+  }
+});
+
 // === START ===
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend running on port ${PORT}`);
