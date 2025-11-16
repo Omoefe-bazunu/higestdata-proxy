@@ -33,7 +33,13 @@ const USER_PIN = process.env.EBILLS_USER_PIN;
 let token = null;
 
 // === MIDDLEWARE ===
-app.use(cors());
+app.use(
+  cors({
+    origin: ["https://www.highestdata.com.ng", "http://localhost:3000"],
+    credentials: true,
+  })
+);
+
 app.use(
   express.json({
     verify: (req, res, buf) => {
