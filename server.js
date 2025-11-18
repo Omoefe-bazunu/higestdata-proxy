@@ -1,4 +1,4 @@
-// server.js - FIXED VERSION
+// server.js - UPDATED WITH COMPLETE WEBHOOK SYSTEM
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -28,14 +28,61 @@ const EBILLS_API_URL =
 const EBILLS_AUTH_URL =
   process.env.EBILLS_AUTH_URL ||
   "https://ebills.africa/wp-json/jwt-auth/v1/token";
+const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY;
+const KORA_PUBLIC_KEY = process.env.KORA_PUBLIC_KEY;
 const USER_PIN = process.env.EBILLS_USER_PIN;
 
 let token = null;
 
+// === RESEND EMAIL FUNCTION ===
+async function sendEmail(to, subject, html) {
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Highest Data <no-reply@highestdata.com.ng>",
+        to,
+        subject,
+        html,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      console.error("Resend error:", err);
+    } else {
+      console.log(`Email sent → ${to}: ${subject}`);
+    }
+  } catch (error) {
+    console.error("Resend failed:", error.message);
+  }
+}
+
 // === MIDDLEWARE ===
 app.use(
   cors({
-    origin: ["https://www.highestdata.com.ng", "http://localhost:3000"],
+    origin: (origin, callback) => {
+      const allowed = [
+        "http://localhost:3000",
+        "https://www.highestdata.com.ng",
+        "https://highestdata.com.ng",
+        "https://higestdata-proxy.onrender.com",
+      ];
+      if (
+        !origin ||
+        allowed.includes(origin) ||
+        origin?.includes("localhost")
+      ) {
+        callback(null, true);
+      } else {
+        console.log("CORS blocked:", origin);
+        callback(new Error("Not allowed"));
+      }
+    },
     credentials: true,
   })
 );
@@ -48,24 +95,7 @@ app.use(
   })
 );
 
-// === eBILLS AUTH ===
-async function getAccessToken() {
-  if (token) return token;
-  const response = await fetch(EBILLS_AUTH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: process.env.EBILLS_USERNAME,
-      password: process.env.EBILLS_PASSWORD,
-    }),
-  });
-  if (!response.ok) throw new Error(`Auth failed: ${response.status}`);
-  const data = await response.json();
-  token = data.token;
-  return token;
-}
-
-// === VERIFY FIREBASE TOKEN ===
+// === AUTH HELPER ===
 async function verifyFirebaseToken(idToken) {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
@@ -75,181 +105,26 @@ async function verifyFirebaseToken(idToken) {
   }
 }
 
-// === HELPER: Remove undefined values from object ===
-function cleanObject(obj) {
-  return Object.fromEntries(
-    Object.entries(obj).filter(([_, v]) => v !== undefined)
-  );
+// === eBILLS AUTH ===
+async function getAccessToken() {
+  if (token) return token;
+  const res = await fetch(EBILLS_AUTH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: process.env.EBILLS_USERNAME,
+      password: process.env.EBILLS_PASSWORD,
+    }),
+  });
+  if (!res.ok) throw new Error("eBills auth failed");
+  const data = await res.json();
+  token = data.token;
+  return token;
 }
 
-// === HELPER: Map eBills status/message to internal status ===
-function mapEBillsStatus(apiResponse) {
-  const status = apiResponse.data?.status;
-  const message = apiResponse.message;
-
-  // Completed states
-  if (status === "completed-api" || message === "ORDER COMPLETED") {
-    return { status: "success", shouldDeductWallet: true };
-  }
-
-  // Processing states (valid, not errors)
-  if (
-    message === "ORDER PROCESSING" ||
-    message === "ORDER QUEUED" ||
-    message === "ORDER INITIATED" ||
-    message === "ORDER PENDING" ||
-    status === "processing-api" ||
-    status === "queued-api" ||
-    status === "initiated-api" ||
-    status === "pending"
-  ) {
-    return { status: "pending", shouldDeductWallet: false };
-  }
-
-  // Failed states
-  if (
-    message === "ORDER FAILED" ||
-    message === "ORDER REFUNDED" ||
-    message === "ORDER CANCELLED" ||
-    status === "failed" ||
-    status === "refunded" ||
-    status === "cancelled"
-  ) {
-    return { status: "failed", shouldDeductWallet: false };
-  }
-
-  // Default to pending for unknown states
-  return { status: "pending", shouldDeductWallet: false };
-}
-
-// === FETCH RATES ===
-app.post("/api/vtu/fetch-rates", async (req, res) => {
-  try {
-    const { type, provider } = req.body;
-    if (!type || !["data", "tv"].includes(type)) {
-      return res.status(400).json({ error: "Invalid type" });
-    }
-
-    await getAccessToken();
-
-    let url = `${EBILLS_API_URL}variations/${type}`;
-    if (type === "tv" && provider) {
-      url += `?service_id=${provider.toLowerCase()}`;
-    }
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const apiResponse = await response.json();
-    if (
-      !apiResponse ||
-      apiResponse.code !== "success" ||
-      !Array.isArray(apiResponse.data)
-    ) {
-      return res.status(500).json({ error: "Invalid response from eBills" });
-    }
-
-    const rates = {};
-    const validProviders =
-      type === "data"
-        ? ["mtn", "airtel", "glo", "9mobile", "smile"]
-        : [provider.toLowerCase()];
-
-    apiResponse.data.forEach((plan) => {
-      if (
-        validProviders.includes(plan.service_id.toLowerCase()) &&
-        plan.availability === "Available" &&
-        !(type === "data" && plan.data_plan.toLowerCase().includes("(sme)"))
-      ) {
-        const sid = plan.service_id.toLowerCase();
-        rates[sid] = rates[sid] || {};
-        rates[sid][plan.variation_id] = {
-          price: parseFloat(plan.price) || 0,
-          name: plan.data_plan || plan.name || `Plan ${plan.variation_id}`,
-        };
-      }
-    });
-
-    res.json({ success: true, rates });
-  } catch (error) {
-    console.error("Fetch rates error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// === TV VERIFY ===
-app.get("/api/tv/verify", async (req, res) => {
-  try {
-    const { provider, customerId } = req.query;
-    if (!provider || !customerId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing provider or customerId" });
-
-    const data = await verifyCustomer(provider, customerId);
-    res.json(
-      data
-        ? { success: true, data }
-        : { success: false, message: "Customer verification failed" }
-    );
-  } catch (error) {
-    console.error("TV verify error:", error);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to verify customer" });
-  }
-});
-
-// === ELECTRICITY VERIFY ===
-app.get("/api/electricity/verify", async (req, res) => {
-  try {
-    const { service_id, customer_id, variation_id } = req.query;
-    if (!service_id || !customer_id || !variation_id) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing service_id, customer_id, or variation_id",
-      });
-    }
-    const data = await verifyCustomer(service_id, customer_id, variation_id);
-    res.json(
-      data
-        ? { success: true, data }
-        : { success: false, message: "Customer verification failed" }
-    );
-  } catch (error) {
-    console.error("Electricity verify error:", error);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to verify customer" });
-  }
-});
-
-// === BETTING VERIFY ===
-app.get("/api/betting/verify", async (req, res) => {
-  try {
-    const { provider, customerId } = req.query;
-    if (!provider || !customerId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing provider or customerId" });
-
-    const data = await verifyCustomer(provider, customerId);
-    res.json(
-      data
-        ? { success: true, data }
-        : { success: false, message: "Customer verification failed" }
-    );
-  } catch (error) {
-    console.error("Betting verify error:", error);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to verify customer" });
-  }
-});
-
-// === TRANSACTION (Airtime, Data, Cable) - FIXED ===
-app.post("/api/vtu/transaction", async (req, res) => {
+// === KORA: Initialize Payment ===
+// === KORA: Initialize Payment ===
+app.post("/api/kora/initialize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
@@ -262,387 +137,442 @@ app.post("/api/vtu/transaction", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
-  const {
-    serviceType,
-    amount,
-    phone,
-    network,
-    variationId,
-    customerId,
-    finalPrice,
-  } = req.body;
-
-  const transactionId = `txn_${Date.now()}_${Math.random()
-    .toString(36)
-    .slice(2)}`;
-  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const { amount } = req.body;
+  if (!amount || amount < 100)
+    return res.status(400).json({ error: "Minimum ₦100" });
 
   try {
-    await getAccessToken();
-    const balance = await (
-      await fetch(`${EBILLS_API_URL}balance`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-    ).json();
+    console.log("Initializing payment for user:", userId, "amount:", amount);
 
-    if (balance.data?.balance < amount) {
-      return res.status(402).json({ error: "Insufficient eBills balance" });
+    const userSnap = await db.collection("users").doc(userId).get();
+    const userData = userSnap.data();
+
+    if (!userData) {
+      return res.status(404).json({ error: "User not found" });
     }
 
-    let apiResponse;
-    if (serviceType === "airtime") {
-      apiResponse = await buyAirtime({
-        phone,
-        serviceId: network,
-        amount,
-        requestId,
-      });
-    } else if (serviceType === "data") {
-      apiResponse = await buyData({
-        phone,
-        serviceId: network,
-        variationId,
-        requestId,
-      });
-    } else if (serviceType === "cable") {
-      apiResponse = await buyTv({
-        customerId,
-        provider: network,
-        variationId,
-        requestId,
-      });
-    } else {
-      return res.status(400).json({ error: "Invalid service type" });
-    }
+    const reference = `KRA_${userId}_${Date.now()}`;
+    console.log("Creating transaction with reference:", reference);
 
-    console.log("eBills API Response:", JSON.stringify(apiResponse, null, 2));
-
-    // FIXED: Check if API call itself failed
-    if (apiResponse.code !== "success") {
-      return res.status(400).json({
-        error: apiResponse.message || "Transaction failed at eBills",
+    await db
+      .collection("koraTransactions")
+      .doc(reference)
+      .set({
+        userId,
+        reference,
+        amount: Number(amount),
+        status: "pending",
+        email: userData.email,
+        name: userData.fullName || userData.email.split("@")[0],
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-    }
 
-    // Map the status correctly
-    const { status: txnStatus, shouldDeductWallet } =
-      mapEBillsStatus(apiResponse);
-
-    // FIXED: Build transaction data without undefined values
-    const txnData = {
-      userId,
-      transactionId,
-      requestId,
-      description: `${serviceType} - ${network || customerId}`,
-      amount: finalPrice,
-      type: "debit",
-      status: txnStatus,
-      serviceType,
-      ebillsAmount: amount,
-      eBillsResponse: apiResponse,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !shouldDeductWallet,
+    const responseData = {
+      publicKey: KORA_PUBLIC_KEY,
+      reference,
+      amount: Number(amount),
+      currency: "NGN",
+      customer: {
+        name: userData.fullName || "Customer",
+        email: userData.email,
+      },
     };
 
-    // Add optional fields only if they exist
-    if (phone) txnData.phone = phone;
-    if (network) txnData.network = network;
-    if (variationId) txnData.variationId = variationId;
-    if (customerId) txnData.customerId = customerId;
+    console.log("Sending initialization response:", responseData);
 
+    res.json(responseData);
+  } catch (error) {
+    console.error("Kora init error:", error);
+    res.status(500).json({ error: "Failed to initialize payment" });
+  }
+});
+
+// === KORA: Verify & Credit Wallet + EMAIL ===
+app.post("/api/kora/verify-and-credit", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { reference } = req.body;
+  if (!reference) return res.status(400).json({ error: "Reference required" });
+
+  try {
+    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
+    if (!txnDoc.exists)
+      return res.status(404).json({ error: "Transaction not found" });
+    if (txnDoc.data().status === "success")
+      return res.json({ success: true, message: "Already credited" });
+
+    const koraRes = await fetch(
+      `https://api.korapay.com/merchant/api/v1/charges/${reference}`,
+      {
+        headers: { Authorization: `Bearer ${KORA_SECRET_KEY}` },
+      }
+    );
+    const koraData = await koraRes.json();
+
+    if (!koraData.status || koraData.data?.status !== "success") {
+      return res.status(400).json({ error: "Payment failed" });
+    }
+
+    const amount = parseFloat(koraData.data.amount);
+    const userSnap = await db.collection("users").doc(userId).get();
+    const userData = userSnap.data();
+
+    const batch = db.batch();
+
+    batch.update(db.collection("users").doc(userId), {
+      walletBalance: admin.firestore.FieldValue.increment(amount),
+    });
+
+    batch.update(txnDoc.ref, {
+      status: "success",
+      processedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    batch.set(
+      db.collection("users").doc(userId).collection("transactions").doc(),
+      {
+        userId,
+        reference,
+        description: "Wallet funding via KoraPay",
+        amount,
+        type: "credit",
+        status: "success",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }
+    );
+
+    await batch.commit();
+
+    // SEND SUCCESS EMAIL
+    await sendEmail(
+      userData.email,
+      "Wallet Funded Successfully!",
+      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
+        <h2 style="color: #10b981;">Payment Successful</h2>
+        <p>Hello <strong>${userData.fullName || userData.email}</strong>,</p>
+        <p>Your wallet has been credited with <strong>₦${amount.toLocaleString()}</strong>.</p>
+        <p><strong>Reference:</strong> ${reference}</p>
+        <p>Thank you for choosing Highest Data!</p>
+      </div>`
+    );
+
+    res.json({ success: true, amount, message: "Wallet credited!" });
+  } catch (error) {
+    console.error("Verify error:", error);
+    res.status(500).json({ error: "Verification failed" });
+  }
+});
+
+// === COMPLETE KORA WEBHOOK - PAYIN & PAYOUT ===
+app.post(
+  "/webhook/kora",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const signature = req.headers["x-korapay-signature"];
+      if (!signature) {
+        console.log("No signature in webhook");
+        return res.status(400).send("No signature");
+      }
+
+      // Verify webhook signature
+      const hash = crypto
+        .createHmac("sha256", KORA_SECRET_KEY)
+        .update(JSON.stringify(req.body.data))
+        .digest("hex");
+
+      if (hash !== signature) {
+        console.log("Invalid webhook signature");
+        return res.status(403).send("Invalid signature");
+      }
+
+      const { event, data } = req.body;
+      console.log(`Webhook received: ${event}`, data);
+
+      // Immediately respond to prevent retries
+      res.status(200).send("Webhook received");
+
+      // Process based on event type
+      if (event === "charge.success") {
+        await handlePayinSuccess(data);
+      } else if (event === "charge.failed") {
+        await handlePayinFailed(data);
+      } else if (event === "transfer.success") {
+        await handlePayoutSuccess(data);
+      } else if (event === "transfer.failed") {
+        await handlePayoutFailed(data);
+      } else {
+        console.log(`Unhandled event type: ${event}`);
+      }
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+      res.status(500).send("Webhook processing error");
+    }
+  }
+);
+
+// === PAYIN SUCCESS HANDLER ===
+async function handlePayinSuccess(data) {
+  const { reference, amount, fee, currency } = data;
+
+  try {
+    // Find transaction in koraTransactions collection
+    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
+
+    if (!txnDoc.exists) {
+      console.log(`Payin transaction not found: ${reference}`);
+      return;
+    }
+
+    const txnData = txnDoc.data();
+
+    // Skip if already processed
+    if (txnData.status === "success") {
+      console.log(`Payin already processed: ${reference}`);
+      return;
+    }
+
+    const userId = txnData.userId;
+    const userSnap = await db.collection("users").doc(userId).get();
+    const userData = userSnap.data();
+
+    const batch = db.batch();
+
+    // Credit user wallet
+    batch.update(db.collection("users").doc(userId), {
+      walletBalance: admin.firestore.FieldValue.increment(amount),
+    });
+
+    // Update transaction status
+    batch.update(txnDoc.ref, {
+      status: "success",
+      processedAt: admin.firestore.FieldValue.serverTimestamp(),
+      webhookProcessed: true,
+    });
+
+    // Add to user transactions
+    batch.set(
+      db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .doc(reference),
+      {
+        userId,
+        reference,
+        description: "Wallet funding via KoraPay",
+        amount,
+        fee,
+        currency,
+        type: "credit",
+        status: "success",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        webhookProcessed: true,
+      }
+    );
+
+    await batch.commit();
+
+    // Send success email
+    await sendEmail(
+      userData.email,
+      "Wallet Funded Successfully!",
+      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
+        <h2 style="color: #10b981;">Payment Successful</h2>
+        <p>Hello <strong>${userData.fullName || userData.email}</strong>,</p>
+        <p>Your wallet has been credited with <strong>₦${amount.toLocaleString()}</strong>.</p>
+        <p><strong>Reference:</strong> ${reference}</p>
+        <p><strong>Fee:</strong> ₦${fee?.toLocaleString() || "0"}</p>
+        <p>Thank you for choosing Highest Data!</p>
+      </div>`
+    );
+
+    console.log(`Payin processed successfully: ${reference}`);
+  } catch (error) {
+    console.error(`Error processing payin success: ${reference}`, error);
+  }
+}
+
+// === PAYIN FAILED HANDLER ===
+async function handlePayinFailed(data) {
+  const { reference } = data;
+
+  try {
+    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
+
+    if (!txnDoc.exists) {
+      console.log(`Failed payin transaction not found: ${reference}`);
+      return;
+    }
+
+    const txnData = txnDoc.data();
+
+    // Update transaction status to failed
+    await txnDoc.ref.update({
+      status: "failed",
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+      webhookProcessed: true,
+    });
+
+    console.log(`Payin marked as failed: ${reference}`);
+  } catch (error) {
+    console.error(`Error processing payin failed: ${reference}`, error);
+  }
+}
+
+// === PAYOUT SUCCESS HANDLER ===
+async function handlePayoutSuccess(data) {
+  const { reference, amount, fee } = data;
+
+  try {
+    const withdrawalDoc = await db
+      .collection("withdrawalRequests")
+      .doc(reference)
+      .get();
+
+    if (!withdrawalDoc.exists) {
+      console.log(`Payout transaction not found: ${reference}`);
+      return;
+    }
+
+    const w = withdrawalDoc.data();
+
+    // Skip if already processed
+    if (w.status === "completed") {
+      console.log(`Payout already processed: ${reference}`);
+      return;
+    }
+
+    const userSnap = await db.collection("users").doc(w.userId).get();
+    const user = userSnap.data();
+
+    const batch = db.batch();
+
+    // Update withdrawal request
+    batch.update(withdrawalDoc.ref, {
+      status: "completed",
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      webhookProcessed: true,
+    });
+
+    // Update user transaction
     const userTxnRef = db
       .collection("users")
-      .doc(userId)
+      .doc(w.userId)
       .collection("transactions")
-      .doc(transactionId);
-
-    // Clean object to remove undefined values before saving
-    await userTxnRef.set(cleanObject(txnData));
-
-    // FIXED: Only deduct wallet if transaction is immediately completed
-    if (shouldDeductWallet) {
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-finalPrice),
-        });
-    }
-
-    res.json({
-      success: true,
-      transactionId,
-      message: shouldDeductWallet
-        ? "Transaction completed"
-        : "Transaction is being processed",
-      status: txnStatus,
-      transactionData: txnData,
+      .doc(reference);
+    batch.update(userTxnRef, {
+      status: "success",
+      webhookProcessed: true,
     });
+
+    await batch.commit();
+
+    // Send success email
+    await sendEmail(
+      user.email,
+      `Withdrawal Successful - ₦${w.amount.toLocaleString()}`,
+      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
+        <h2 style="color: #10b981;">Withdrawal Completed</h2>
+        <p>Hello <strong>${user.fullName || user.email}</strong>,</p>
+        <p><strong>₦${w.amount.toLocaleString()}</strong> has been successfully sent to your bank account.</p>
+        <p><strong>Account:</strong> ${w.accountName} - ${w.accountNumber}</p>
+        <p><strong>Reference:</strong> ${reference}</p>
+        <p><strong>Fee:</strong> ₦${w.fee?.toLocaleString() || "50"}</p>
+        <p>Thank you for using Highest Data!</p>
+      </div>`
+    );
+
+    console.log(`Payout processed successfully: ${reference}`);
   } catch (error) {
-    console.error("Transaction error:", error);
-    res.status(500).json({ error: error.message });
+    console.error(`Error processing payout success: ${reference}`, error);
   }
-});
+}
 
-// === ELECTRICITY PURCHASE ===
-const VALID_PROVIDERS = [
-  "ikeja-electric",
-  "eko-electric",
-  "kano-electric",
-  "portharcourt-electric",
-  "jos-electric",
-  "ibadan-electric",
-  "kaduna-electric",
-  "abuja-electric",
-  "enugu-electric",
-  "benin-electric",
-  "aba-electric",
-  "yola-electric",
-];
-const VALID_VARIATIONS = ["prepaid", "postpaid"];
-
-app.post("/api/electricity/purchase", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const {
-    amount,
-    provider,
-    customerId,
-    variationId,
-    serviceCharge,
-    totalAmount,
-  } = req.body;
-
-  const transactionId = `txn_${Date.now()}_${Math.random()
-    .toString(36)
-    .slice(2)}`;
-  const requestId = `req_${Date.now()}_electricity_${userId.slice(
-    -6
-  )}_${Math.floor(Math.random() * 1000)}`;
+// === PAYOUT FAILED HANDLER ===
+async function handlePayoutFailed(data) {
+  const { reference } = data;
 
   try {
-    if (
-      !VALID_PROVIDERS.includes(provider) ||
-      !VALID_VARIATIONS.includes(variationId)
-    ) {
-      return res.status(400).json({ error: "Invalid provider or meter type" });
+    const withdrawalDoc = await db
+      .collection("withdrawalRequests")
+      .doc(reference)
+      .get();
+
+    if (!withdrawalDoc.exists) {
+      console.log(`Failed payout transaction not found: ${reference}`);
+      return;
     }
 
-    const electricityAmount = parseFloat(amount);
-    const total = parseFloat(totalAmount);
-    if (electricityAmount < 1000 || electricityAmount > 100000) {
-      return res.status(400).json({ error: "Amount out of range" });
+    const w = withdrawalDoc.data();
+
+    // Skip if already processed
+    if (w.status === "failed") {
+      console.log(`Payout already marked as failed: ${reference}`);
+      return;
     }
 
-    await getAccessToken();
-    const balance = await getBalance();
-    if (balance < electricityAmount)
-      return res.status(503).json({ error: "Platform funds low" });
+    const userSnap = await db.collection("users").doc(w.userId).get();
+    const user = userSnap.data();
 
-    const customerData = await verifyCustomer(
-      provider,
-      customerId,
-      variationId
-    );
-    if (!customerData) return res.status(400).json({ error: "Invalid meter" });
-    if (customerData.min_purchase_amount > electricityAmount)
-      return res.status(400).json({ error: "Below minimum" });
-    if (
-      customerData.customer_arrears > 0 &&
-      electricityAmount < customerData.customer_arrears
-    ) {
-      return res.status(400).json({ error: "Below arrears" });
-    }
+    const batch = db.batch();
 
-    const ebillsResponse = await purchaseElectricity(
-      requestId,
-      customerId,
-      provider,
-      variationId,
-      electricityAmount
-    );
+    // Refund wallet balance
+    batch.update(db.collection("users").doc(w.userId), {
+      walletBalance: admin.firestore.FieldValue.increment(w.totalAmount),
+    });
 
-    if (ebillsResponse.code !== "success") {
-      return res
-        .status(400)
-        .json({ error: ebillsResponse?.message || "eBills failed" });
-    }
+    // Update withdrawal request
+    batch.update(withdrawalDoc.ref, {
+      status: "failed",
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+      webhookProcessed: true,
+    });
 
-    const { status: txnStatus, shouldDeductWallet } =
-      mapEBillsStatus(ebillsResponse);
-
-    const txnData = {
-      userId,
-      transactionId,
-      requestId,
-      description: `Electricity - ${provider}`,
-      amount: total,
-      type: "debit",
-      status: txnStatus,
-      serviceType: "electricity",
-      provider,
-      customerId,
-      variationId,
-      electricityAmount,
-      serviceCharge: parseFloat(serviceCharge),
-      ebillsResponse,
-      customerName: customerData.customer_name,
-      customerAddress: customerData.customer_address,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !shouldDeductWallet,
-    };
-
-    await db
+    // Update user transaction
+    const userTxnRef = db
       .collection("users")
-      .doc(userId)
+      .doc(w.userId)
       .collection("transactions")
-      .doc(transactionId)
-      .set(cleanObject(txnData));
+      .doc(reference);
+    batch.update(userTxnRef, {
+      status: "failed",
+      webhookProcessed: true,
+    });
 
-    if (shouldDeductWallet) {
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-total),
-        });
-    }
+    await batch.commit();
 
-    res.json({ success: true, transactionId, transactionData: txnData });
-  } catch (error) {
-    console.error("Electricity error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// === BETTING FUND ===
-const VALID_BETTING_PROVIDERS = [
-  "1xBet",
-  "BangBet",
-  "Bet9ja",
-  "BetKing",
-  "BetLand",
-  "BetLion",
-  "BetWay",
-  "CloudBet",
-  "LiveScoreBet",
-  "MerryBet",
-  "NaijaBet",
-  "NairaBet",
-  "SupaBet",
-];
-
-app.post("/api/betting/fund", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const { amount, provider, customerId, serviceCharge, totalAmount } = req.body;
-
-  const transactionId = `txn_${Date.now()}_${Math.random()
-    .toString(36)
-    .slice(2)}`;
-  const requestId = `req_${Date.now()}_betting_${userId.slice(-6)}_${Math.floor(
-    Math.random() * 1000
-  )}`;
-
-  try {
-    if (!VALID_BETTING_PROVIDERS.includes(provider)) {
-      return res.status(400).json({ error: "Invalid provider" });
-    }
-
-    const bettingAmount = parseFloat(amount);
-    const total = parseFloat(totalAmount);
-    if (bettingAmount < 100 || bettingAmount > 100000) {
-      return res.status(400).json({ error: "Amount out of range" });
-    }
-
-    await getAccessToken();
-    const balance = await getBalance();
-    if (balance < bettingAmount)
-      return res.status(503).json({ error: "Platform funds low" });
-
-    const customerData = await verifyCustomer(provider, customerId);
-    if (!customerData)
-      return res.status(400).json({ error: "Invalid customer ID" });
-
-    const ebillsResponse = await fundBettingAccount(
-      requestId,
-      customerId,
-      provider,
-      bettingAmount
+    // Send failure email
+    await sendEmail(
+      user.email,
+      "Withdrawal Failed - Refunded",
+      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
+        <h2 style="color: #ef4444;">Withdrawal Failed</h2>
+        <p>Hello <strong>${user.fullName || user.email}</strong>,</p>
+        <p>Your withdrawal of <strong>₦${w.amount.toLocaleString()}</strong> has failed.</p>
+        <p><strong>₦${w.totalAmount.toLocaleString()}</strong> has been refunded to your wallet balance.</p>
+        <p><strong>Reference:</strong> ${reference}</p>
+        <p>Please try again or contact support if the issue persists.</p>
+      </div>`
     );
 
-    if (ebillsResponse.code !== "success") {
-      return res
-        .status(400)
-        .json({ error: ebillsResponse?.message || "eBills failed" });
-    }
-
-    const { status: txnStatus, shouldDeductWallet } =
-      mapEBillsStatus(ebillsResponse);
-
-    const txnData = {
-      userId,
-      transactionId,
-      requestId,
-      description: `Betting - ${provider}`,
-      amount: total,
-      type: "debit",
-      status: txnStatus,
-      serviceType: "betting",
-      provider,
-      customerId,
-      bettingAmount,
-      serviceCharge: parseFloat(serviceCharge),
-      ebillsResponse,
-      customerName: customerData.customer_name || customerId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      pending: !shouldDeductWallet,
-    };
-
-    await db
-      .collection("users")
-      .doc(userId)
-      .collection("transactions")
-      .doc(transactionId)
-      .set(txnData);
-
-    if (shouldDeductWallet) {
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-total),
-        });
-    }
-
-    res.json({ success: true, transactionId, transactionData: txnData });
+    console.log(`Payout failed and refunded: ${reference}`);
   } catch (error) {
-    console.error("Betting error:", error);
-    res.status(500).json({ error: error.message });
+    console.error(`Error processing payout failed: ${reference}`, error);
   }
-});
+}
 
-// === WEBHOOK (FIXED) - Handles ALL services ===
+// === WEBHOOK FOR eBILLS (async transactions) ===
 app.post("/webhook", async (req, res) => {
   const signature = req.headers["x-signature"];
   const payload = req.rawBody.toString();
@@ -650,359 +580,414 @@ app.post("/webhook", async (req, res) => {
     .createHmac("sha256", USER_PIN)
     .update(payload)
     .digest("hex");
+  if (hash !== signature) return res.status(403).json({ error: "Invalid sig" });
 
-  if (hash !== signature) {
-    console.log("Invalid webhook signature");
-    return res.status(403).json({ error: "Invalid signature" });
-  }
+  const { request_id, status } = req.body;
+  const snapshot = await db
+    .collectionGroup("transactions")
+    .where("requestId", "==", request_id)
+    .where("pending", "==", true)
+    .get();
 
-  const { request_id, status, order_id } = req.body;
+  if (snapshot.empty) return res.json({ status: "no pending txn" });
 
-  if (!request_id) {
-    console.log("Webhook missing request_id:", req.body);
-    return res.status(400).json({ error: "Missing request_id" });
-  }
-
-  console.log("WEBHOOK RECEIVED:", {
-    request_id,
-    status,
-    order_id,
-    fullBody: req.body,
+  const batch = db.batch();
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    const isSuccess = ["completed-api", "ORDER COMPLETED", "success"].includes(
+      status
+    );
+    if (isSuccess) {
+      batch.update(doc.ref, { status: "success", pending: false });
+      batch.update(db.collection("users").doc(data.userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-data.amount),
+      });
+    } else {
+      batch.update(doc.ref, { status: "failed", pending: false });
+    }
   });
 
+  await batch.commit();
+  res.json({ status: "success" });
+});
+
+// === WITHDRAWAL: Send OTP ===
+app.post("/api/withdrawal/send-otp", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
   try {
-    const snapshot = await db
-      .collectionGroup("transactions")
-      .where("requestId", "==", request_id)
-      .where("pending", "==", true)
-      .get();
+    userId = await verifyFirebaseToken(idToken);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
 
-    if (snapshot.empty) {
-      console.log("No pending transaction found for request_id:", request_id);
-      return res.json({ status: "ignored - no pending transaction" });
-    }
+  const userDoc = await db.collection("users").doc(userId).get();
+  const userData = userDoc.data();
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    const batch = db.batch();
-
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      const txnRef = doc.ref;
-      const userRef = db.collection("users").doc(data.userId);
-
-      // FIXED: Comprehensive status mapping
-      const isSuccess =
-        status === "completed-api" ||
-        status === "ORDER COMPLETED" ||
-        status === "completed" ||
-        status === "success";
-
-      const isFailed =
-        status === "failed" ||
-        status === "refunded" ||
-        status === "ORDER FAILED" ||
-        status === "ORDER REFUNDED" ||
-        status === "ORDER CANCELLED" ||
-        status === "cancelled" ||
-        status === "error";
-
-      const isPending =
-        status === "ORDER PROCESSING" ||
-        status === "ORDER QUEUED" ||
-        status === "ORDER INITIATED" ||
-        status === "ORDER PENDING" ||
-        status === "ORDER ON-HOLD" ||
-        status === "processing-api" ||
-        status === "queued-api" ||
-        status === "initiated-api" ||
-        status === "pending" ||
-        status === "on-hold";
-
-      if (isSuccess) {
-        batch.update(txnRef, {
-          status: "success",
-          pending: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        // Deduct wallet on success
-        batch.update(userRef, {
-          walletBalance: admin.firestore.FieldValue.increment(-data.amount),
-        });
-        console.log(
-          `✅ SUCCESS: Wallet deducted ₦${data.amount} for ${data.userId}`
-        );
-      } else if (isFailed) {
-        batch.update(txnRef, {
-          status: "failed",
-          pending: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        console.log(`❌ FAILED: Transaction ${request_id} marked as failed`);
-        // No wallet deduction for failed transactions
-      } else if (isPending) {
-        // Keep as pending, don't deduct wallet yet
-        batch.update(txnRef, {
-          status: "pending",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        console.log(`⏳ PENDING: Transaction ${request_id} still processing`);
-      } else {
-        // Unknown status - log and keep pending
-        console.log(`⚠️ UNKNOWN STATUS: ${status} for ${request_id}`);
-        batch.update(txnRef, {
-          status: status || "pending",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      }
+  await db
+    .collection("users")
+    .doc(userId)
+    .update({
+      verificationToken: otp,
+      verificationTokenExpiry: new Date(
+        Date.now() + 10 * 60 * 1000
+      ).toISOString(),
     });
 
-    await batch.commit();
-    console.log("✅ Webhook processed successfully");
-    res.json({ status: "success" });
+  await sendEmail(
+    userData.email,
+    "Your Withdrawal OTP",
+    `<h2 style="color:#4f46e5;">Highest Data</h2>
+     <h3>Your OTP: <span style="font-size:32px;color:#10b981;letter-spacing:8px;">${otp}</span></h3>
+     <p>Valid for 10 minutes</p>`
+  );
+
+  res.json({ success: true });
+});
+
+// === WITHDRAWAL: Verify OTP ===
+app.post("/api/withdrawal/verify-otp", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  const { otp } = req.body;
+  if (!otp) return res.status(400).json({ error: "OTP required" });
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    if (!userData.verificationToken || !userData.verificationTokenExpiry) {
+      return res.status(400).json({ error: "OTP not requested" });
+    }
+
+    if (userData.verificationToken !== otp) {
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+
+    if (new Date() > new Date(userData.verificationTokenExpiry)) {
+      return res.status(400).json({ error: "OTP expired" });
+    }
+
+    // Clear OTP after successful verification
+    await db.collection("users").doc(userId).update({
+      verificationToken: null,
+      verificationTokenExpiry: null,
+    });
+
+    res.json({ success: true, message: "OTP verified successfully" });
   } catch (error) {
-    console.error("❌ Webhook error:", error);
-    res.status(500).json({ error: "Failed" });
+    console.error("OTP verification error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// === eBILLS HELPERS ===
-async function verifyCustomer(serviceId, customerId, variationId = null) {
-  const body = { service_id: serviceId, customer_id: customerId };
-  if (variationId) body.variation_id = variationId;
-
-  const res = await fetch(`${EBILLS_API_URL}verify-customer`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  return data.code === "success" ? data.data : null;
-}
-
-async function purchaseElectricity(
-  requestId,
-  customerId,
-  serviceId,
-  variationId,
-  amount
-) {
-  const res = await fetch(`${EBILLS_API_URL}electricity`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      request_id: requestId,
-      customer_id: customerId,
-      service_id: serviceId,
-      variation_id: variationId,
-      amount,
-    }),
-  });
-  return res.json();
-}
-
-async function fundBettingAccount(requestId, customerId, serviceId, amount) {
-  const res = await fetch(`${EBILLS_API_URL}betting`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      request_id: requestId,
-      customer_id: customerId,
-      service_id: serviceId,
-      amount,
-    }),
-  });
-  return res.json();
-}
-
-async function buyAirtime({ phone, serviceId, amount, requestId }) {
-  const res = await fetch(`${EBILLS_API_URL}airtime`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      phone,
-      service_id: serviceId.toLowerCase(),
-      amount: Number(amount),
-      request_id: requestId,
-    }),
-  });
-  return res.json();
-}
-
-async function buyData({ phone, serviceId, variationId, requestId }) {
-  const res = await fetch(`${EBILLS_API_URL}data`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      phone,
-      service_id: serviceId.toLowerCase(),
-      variation_id: variationId,
-      request_id: requestId,
-    }),
-  });
-  return res.json();
-}
-
-async function buyTv({ customerId, provider, variationId, requestId }) {
-  const res = await fetch(`${EBILLS_API_URL}tv`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      customer_id: customerId,
-      service_id: provider.toLowerCase(),
-      variation_id: variationId,
-      request_id: requestId,
-    }),
-  });
-  return res.json();
-}
-
-// === eBILLS BALANCE CHECK ===
-async function getBalance() {
+// === GET BANKS LIST ===
+app.get("/api/banks", async (req, res) => {
   try {
-    const res = await fetch(`${EBILLS_API_URL}balance`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await res.json();
-    return data.data?.balance || 0;
+    console.log("Fetching banks from KoraPay...");
+
+    const koraRes = await fetch(
+      "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
+      {
+        headers: {
+          Authorization: `Bearer ${KORA_PUBLIC_KEY}`, // Use PUBLIC key for this endpoint
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("KoraPay banks response status:", koraRes.status);
+
+    const data = await koraRes.json();
+    console.log("KoraPay banks response data received");
+
+    if (koraRes.ok && data.status) {
+      // Format the banks data to match what the frontend expects
+      const formattedBanks = data.data.map((bank) => ({
+        code: bank.code,
+        name: bank.name,
+        nibss_bank_code: bank.nibss_bank_code,
+      }));
+
+      res.json({
+        success: true,
+        data: formattedBanks,
+        message: "Banks fetched successfully",
+      });
+    } else {
+      console.error("KoraPay banks API error:", data);
+      res.status(koraRes.status).json({
+        success: false,
+        error: data.message || "Failed to fetch banks from payment provider",
+        koraError: data,
+      });
+    }
   } catch (error) {
-    console.error("Balance check failed:", error);
-    return 0;
+    console.error("Banks fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error while fetching banks",
+      details: error.message,
+    });
   }
-}
+});
 
-// Add this new endpoint to your server.js
+// === RESOLVE ACCOUNT NUMBER ===
+app.post("/api/resolve-account", async (req, res) => {
+  const { bankCode, accountNumber } = req.body;
 
-// === PROCESS WITHDRAWAL (Admin Action) ===
+  if (!bankCode || !accountNumber) {
+    return res.status(400).json({
+      success: false,
+      error: "Bank code and account number are required",
+    });
+  }
+
+  try {
+    console.log("Resolving account:", { bankCode, accountNumber });
+
+    const koraRes = await fetch(
+      "https://api.korapay.com/merchant/api/v1/misc/banks/resolve",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${KORA_SECRET_KEY}`, // Use SECRET key for this endpoint
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          bank: bankCode,
+          account: accountNumber,
+        }),
+      }
+    );
+
+    console.log("KoraPay resolve response status:", koraRes.status);
+
+    const data = await koraRes.json();
+    console.log("KoraPay resolve response:", data);
+
+    if (koraRes.ok && data.status) {
+      res.json({
+        success: true,
+        data: data.data,
+        message: "Account resolved successfully",
+      });
+    } else {
+      console.error("KoraPay resolve API error:", data);
+      res.status(koraRes.status).json({
+        success: false,
+        error: data.message || "Failed to resolve account number",
+        koraError: data,
+      });
+    }
+  } catch (error) {
+    console.error("Account resolution error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error while resolving account",
+      details: error.message,
+    });
+  }
+});
+
+// === WITHDRAWAL: Process (User submits) ===
 app.post("/api/withdrawal/process", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
-  let adminUserId;
 
+  let userId;
   try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    adminUserId = decodedToken.uid;
-    if (decodedToken.email !== "highestdatafintechsolutions@gmail.com") {
-      return res
-        .status(403)
-        .json({ error: "Forbidden: Admin access required" });
+    userId = await verifyFirebaseToken(idToken);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  const { amount, bankCode, accountNumber, accountName } = req.body;
+  const withdrawalAmount = parseFloat(amount);
+  const FEE = 50;
+  const totalAmount = withdrawalAmount + FEE;
+
+  const userDoc = await db.collection("users").doc(userId).get();
+  const userData = userDoc.data();
+
+  if (totalAmount > userData.walletBalance)
+    return res.status(400).json({ error: "Insufficient balance" });
+
+  const reference = `WDR_${userId}_${Date.now()}`;
+
+  const batch = db.batch();
+
+  // Deduct from wallet
+  batch.update(db.collection("users").doc(userId), {
+    walletBalance: admin.firestore.FieldValue.increment(-totalAmount),
+  });
+
+  // Create withdrawal request
+  batch.set(db.collection("withdrawalRequests").doc(reference), {
+    userId,
+    reference,
+    amount: withdrawalAmount,
+    totalAmount,
+    fee: FEE,
+    bankCode,
+    accountNumber,
+    accountName,
+    status: "processing",
+    userEmail: userData.email,
+    userName: userData.fullName || userData.email,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Create user transaction record
+  batch.set(
+    db
+      .collection("users")
+      .doc(userId)
+      .collection("transactions")
+      .doc(reference),
+    {
+      userId,
+      reference,
+      description: `Withdrawal to ${accountName}`,
+      amount: -totalAmount,
+      type: "debit",
+      status: "processing",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     }
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
+  );
 
-  const { requestId, action } = req.body;
-  if (!requestId || !["complete", "reject"].includes(action)) {
-    return res.status(400).json({ error: "Invalid request parameters" });
-  }
+  await batch.commit();
 
+  // Initiate payout via Kora
   try {
-    const withdrawalRef = db.collection("withdrawalRequests").doc(requestId);
-    const withdrawalSnap = await withdrawalRef.get();
-    if (!withdrawalSnap.exists)
-      return res.status(404).json({ error: "Withdrawal request not found" });
-
-    const withdrawalData = withdrawalSnap.data();
-    if (withdrawalData.status !== "pending")
-      return res.status(400).json({ error: "Withdrawal already processed" });
-
-    const newStatus = action === "complete" ? "completed" : "failed";
-    const userRef = db.collection("users").doc(withdrawalData.userId);
-
-    await db.runTransaction(async (transaction) => {
-      const userSnap = await transaction.get(userRef);
-      if (!userSnap.exists) throw new Error("User not found");
-      const currentBalance = userSnap.data().walletBalance || 0;
-      let newBalance = currentBalance;
-
-      if (action === "complete") {
-        if (currentBalance < withdrawalData.totalAmount) {
-          throw new Error("Insufficient balance");
-        }
-        newBalance = currentBalance - withdrawalData.totalAmount;
+    const koraRes = await fetch(
+      "https://api.korapay.com/merchant/api/v1/transactions/disburse",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${KORA_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          reference,
+          destination: {
+            type: "bank_account",
+            amount: withdrawalAmount,
+            currency: "NGN",
+            narration: "Withdrawal from Highest Data",
+            bank_account: {
+              bank: bankCode,
+              account: accountNumber,
+              account_name: accountName,
+            },
+          },
+          customer: {
+            name: userData.fullName || userData.email,
+            email: userData.email,
+          },
+        }),
       }
-      // REJECT: No wallet change
+    );
 
-      transaction.update(withdrawalRef, {
-        status: newStatus,
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
-        processedBy: adminUserId,
+    const koraData = await koraRes.json();
+
+    if (!koraData.status) {
+      // Refund on immediate failure
+      const refundBatch = db.batch();
+      refundBatch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(totalAmount),
       });
-
-      transaction.update(userRef, { walletBalance: newBalance });
-
-      const txQuery = await db
-        .collection("users")
-        .doc(withdrawalData.userId)
-        .collection("transactions")
-        .where("reference", "==", withdrawalData.reference)
-        .get();
-
-      txQuery.docs.forEach((txDoc) => {
-        transaction.update(txDoc.ref, {
-          status: newStatus,
-          processedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+      refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
+        status: "failed",
+        failureReason: koraData.message || "Payout initiation failed",
       });
-    });
-    //
-
-    try {
-      await fetch(
-        `${
-          process.env.BASE_URL || "http://localhost:3000"
-        }/api/withdrawal/notify-user`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            email: withdrawalData.userEmail,
-            userName: withdrawalData.userName,
-            amount: withdrawalData.amount,
-            status: newStatus,
-            reference: withdrawalData.reference,
-            bankName: withdrawalData.bankName,
-            accountNumber: withdrawalData.accountNumber,
-          }),
-        }
+      refundBatch.update(
+        db
+          .collection("users")
+          .doc(userId)
+          .collection("transactions")
+          .doc(reference),
+        { status: "failed" }
       );
-    } catch (emailError) {
-      console.error("Email failed:", emailError);
+      await refundBatch.commit();
+
+      return res.status(400).json({
+        error: koraData.message || "Payout failed to initiate",
+      });
     }
 
     res.json({
       success: true,
-      message: `Withdrawal ${newStatus}`,
-      withdrawalId: requestId,
-      status: newStatus,
+      reference,
+      message: "Withdrawal processing started",
     });
   } catch (error) {
-    console.error("Error:", error);
-    res
-      .status(500)
-      .json({ error: error.message || "Failed to process withdrawal" });
+    console.error("Kora payout initiation error:", error);
+
+    // Refund on network error
+    const refundBatch = db.batch();
+    refundBatch.update(db.collection("users").doc(userId), {
+      walletBalance: admin.firestore.FieldValue.increment(totalAmount),
+    });
+    refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
+      status: "failed",
+      failureReason: "Network error during payout initiation",
+    });
+    refundBatch.update(
+      db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .doc(reference),
+      { status: "failed" }
+    );
+    await refundBatch.commit();
+
+    res.status(500).json({ error: "Failed to initiate payout" });
   }
 });
 
-// === START ===
+// === HEALTH CHECK ===
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    service: "Highest Data Backend",
+  });
+});
+
+// === WEBHOOK TEST ENDPOINT ===
+app.get("/webhook/test", (req, res) => {
+  res.json({
+    message: "Webhook endpoint is accessible",
+    url: "/webhook/kora",
+    method: "POST",
+  });
+});
+
+// === START SERVER ===
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend running on port ${PORT}`);
+  console.log(`Live at: https://higestdata-proxy.onrender.com`);
+  console.log(
+    `Kora Webhook: https://higestdata-proxy.onrender.com/webhook/kora`
+  );
+  console.log(`Health Check: https://higestdata-proxy.onrender.com/health`);
 });
