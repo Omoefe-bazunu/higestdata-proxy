@@ -975,6 +975,86 @@ app.post("/api/betting/fund", async (req, res) => {
   }
 });
 
+// === BULK SMS PURCHASE ===
+app.post("/api/sms/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { message, sendto, sender, ref } = req.body;
+  if (!message || !sendto || !sender || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Get SMS rate from Firestore
+    const smsRatesDoc = await db.collection("settings").doc("smsRates").get();
+    const smsRate = smsRatesDoc.exists
+      ? smsRatesDoc.data().pricePerSms || 2
+      : 2; // default ₦2
+
+    const numbers = sendto.split(",").filter((n) => n.trim());
+    const totalCost = numbers.length * smsRate;
+
+    if (totalCost > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    const vtuResponse = await makeVtuAfricaRequest("sms", {
+      message,
+      sendto,
+      sender,
+      ref,
+    });
+
+    if (vtuResponse.code === 101) {
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-totalCost),
+        });
+
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "sms",
+          message,
+          recipients: numbers.length,
+          amountCharged: totalCost,
+          reference: ref,
+          status: "success",
+          description: `Bulk SMS to ${numbers.length} contacts`,
+          vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({ success: true, data: vtuResponse, charged: totalCost });
+    } else {
+      res
+        .status(400)
+        .json({ error: vtuResponse.description?.message || "SMS failed" });
+    }
+  } catch (error) {
+    console.error("SMS error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // === VTU AFRICA WEBHOOK HANDLER ===
 app.post("/webhook/vtu", async (req, res) => {
   try {
