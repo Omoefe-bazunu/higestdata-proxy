@@ -143,7 +143,6 @@ async function makeVtuAfricaRequest(endpoint, params) {
 }
 
 // === AIRTIME PURCHASE ===
-// === AIRTIME PURCHASE ===
 app.post("/api/airtime/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -167,14 +166,14 @@ app.post("/api/airtime/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get airtime rates to calculate discount
+    // Get airtime rates to calculate discount - FIXED: use .exists not .exists()
     const airtimeRatesDoc = await db
       .collection("settings")
       .doc("airtimeRates")
       .get();
-    const airtimeRates = airtimeRatesDoc.exists()
+    const airtimeRates = airtimeRatesDoc.exists
       ? airtimeRatesDoc.data().rates
-      : {};
+      : {}; // ← FIXED
 
     const discountPercentage = airtimeRates[network]?.discountPercentage || 0;
     const amountToVTU = parseFloat(amount); // Full amount sent to VTU Africa
@@ -250,7 +249,6 @@ app.post("/api/airtime/purchase", async (req, res) => {
 });
 
 // === DATA PURCHASE ===
-// === DATA PURCHASE ===
 app.post("/api/data/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -274,9 +272,9 @@ app.post("/api/data/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get data rates to find the plan price
+    // Get data rates to find the plan price - FIXED: use .exists not .exists()
     const dataRatesDoc = await db.collection("settings").doc("dataRates").get();
-    const dataRates = dataRatesDoc.exists() ? dataRatesDoc.data().rates : {};
+    const dataRates = dataRatesDoc.exists ? dataRatesDoc.data().rates : {}; // ← FIXED
 
     const planData = dataRates[service]?.plans?.[DataPlan];
 
@@ -307,8 +305,6 @@ app.post("/api/data/purchase", async (req, res) => {
     });
 
     if (vtuResponse.code === 101) {
-      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
-
       // Deduct FINAL PRICE (with profit) from wallet
       await db
         .collection("users")
@@ -379,9 +375,9 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get TV rates to find the plan price
+    // Get TV rates to find the plan price - FIXED: use .exists not .exists()
     const tvRatesDoc = await db.collection("settings").doc("tvRates").get();
-    const tvRates = tvRatesDoc.exists() ? tvRatesDoc.data().rates : {};
+    const tvRates = tvRatesDoc.exists ? tvRatesDoc.data().rates : {}; // ← FIXED
 
     const planData = tvRates[service]?.plans?.[variation];
 
@@ -412,8 +408,6 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     });
 
     if (vtuResponse.code === 101) {
-      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
-
       // Deduct FINAL PRICE (with profit) from wallet
       await db
         .collection("users")
@@ -462,7 +456,6 @@ app.post("/api/cabletv/purchase", async (req, res) => {
 });
 
 // === ELECTRICITY BILL PAYMENT ===
-// === ELECTRICITY BILL PAYMENT ===
 app.post("/api/electricity/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -486,15 +479,14 @@ app.post("/api/electricity/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // For electricity, we might have a small service charge
-    // You can configure this in settings if needed
+    // For electricity, we might have a small service charge - FIXED: use .exists not .exists()
     const electricityRatesDoc = await db
       .collection("settings")
       .doc("electricityRates")
       .get();
-    const electricityRates = electricityRatesDoc.exists()
+    const electricityRates = electricityRatesDoc.exists
       ? electricityRatesDoc.data()
-      : {};
+      : {}; // ← FIXED
 
     const serviceChargePercentage = electricityRates.serviceCharge || 0; // Default 0% if not set
 
@@ -522,8 +514,6 @@ app.post("/api/electricity/purchase", async (req, res) => {
     });
 
     if (vtuResponse.code === 101) {
-      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
-
       // Deduct TOTAL AMOUNT (electricity + service charge) from wallet
       await db
         .collection("users")
@@ -572,7 +562,6 @@ app.post("/api/electricity/purchase", async (req, res) => {
 });
 
 // === EXAM SCRATCH CARDS ===
-// === EXAM SCRATCH CARDS ===
 app.post("/api/exam/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -597,10 +586,9 @@ app.post("/api/exam/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // For exam cards, we might have a profit margin
-    // You can configure exam card rates in settings
+    // For exam cards, we might have a profit margin - FIXED: use .exists not .exists()
     const examRatesDoc = await db.collection("settings").doc("examRates").get();
-    const examRates = examRatesDoc.exists() ? examRatesDoc.data() : {};
+    const examRates = examRatesDoc.exists ? examRatesDoc.data() : {}; // ← FIXED
 
     const profitPercentage = examRates.profitMargin || 0; // Default 0% if not set
 
@@ -752,9 +740,6 @@ app.post("/api/airtime-cash/convert", async (req, res) => {
   }
 
   try {
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
     // Build parameters
     const params = {
       network,
@@ -879,12 +864,12 @@ app.post("/api/betting/fund", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get betting rates to calculate service charge
+    // Get betting rates to calculate service charge - FIXED: use .exists not .exists()
     const bettingRatesDoc = await db
       .collection("settings")
       .doc("bettingRates")
       .get();
-    const bettingRates = bettingRatesDoc.exists() ? bettingRatesDoc.data() : {};
+    const bettingRates = bettingRatesDoc.exists ? bettingRatesDoc.data() : {}; // ← FIXED
 
     const serviceCharge = parseFloat(bettingRates.serviceCharge) || 0;
     const chargeType = bettingRates.chargeType || "fixed";
@@ -919,8 +904,6 @@ app.post("/api/betting/fund", async (req, res) => {
     });
 
     if (vtuResponse.code === 101) {
-      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
-
       // Deduct TOTAL AMOUNT (betting + service charge) from wallet
       await db
         .collection("users")
@@ -1010,6 +993,7 @@ app.post("/webhook/vtu", async (req, res) => {
   }
 });
 
+// ==================== KORA PAYMENT ENDPOINTS ====================
 // === KORA: Initialize Payment ===
 app.post("/api/kora/initialize", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1459,6 +1443,45 @@ async function handlePayoutFailed(data) {
   }
 }
 
+// === WEBHOOK FOR eBILLS (async transactions) ===
+app.post("/webhook", async (req, res) => {
+  const signature = req.headers["x-signature"];
+  const payload = req.rawBody.toString();
+  const hash = crypto
+    .createHmac("sha256", USER_PIN)
+    .update(payload)
+    .digest("hex");
+  if (hash !== signature) return res.status(403).json({ error: "Invalid sig" });
+
+  const { request_id, status } = req.body;
+  const snapshot = await db
+    .collectionGroup("transactions")
+    .where("requestId", "==", request_id)
+    .where("pending", "==", true)
+    .get();
+
+  if (snapshot.empty) return res.json({ status: "no pending txn" });
+
+  const batch = db.batch();
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    const isSuccess = ["completed-api", "ORDER COMPLETED", "success"].includes(
+      status
+    );
+    if (isSuccess) {
+      batch.update(doc.ref, { status: "success", pending: false });
+      batch.update(db.collection("users").doc(data.userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-data.amount),
+      });
+    } else {
+      batch.update(doc.ref, { status: "failed", pending: false });
+    }
+  });
+
+  await batch.commit();
+  res.json({ status: "success" });
+});
+
 // === WITHDRAWAL: Send OTP ===
 app.post("/api/withdrawal/send-otp", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1553,7 +1576,7 @@ app.get("/api/banks", async (req, res) => {
       "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
       {
         headers: {
-          Authorization: `Bearer ${KORA_PUBLIC_KEY}`,
+          Authorization: `Bearer ${KORA_PUBLIC_KEY}`, // Use PUBLIC key for this endpoint
           "Content-Type": "application/json",
         },
       }
@@ -1565,6 +1588,7 @@ app.get("/api/banks", async (req, res) => {
     console.log("KoraPay banks response data received");
 
     if (koraRes.ok && data.status) {
+      // Format the banks data to match what the frontend expects
       const formattedBanks = data.data.map((bank) => ({
         code: bank.code,
         name: bank.name,
@@ -1613,7 +1637,7 @@ app.post("/api/resolve-account", async (req, res) => {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${KORA_SECRET_KEY}`,
+          Authorization: `Bearer ${KORA_SECRET_KEY}`, // Use SECRET key for this endpoint
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -1653,6 +1677,7 @@ app.post("/api/resolve-account", async (req, res) => {
 });
 
 // === WITHDRAWAL: Process (User submits) ===
+// === WITHDRAWAL: Process (User submits) ===
 app.post("/api/withdrawal/process", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -1679,12 +1704,14 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
   const reference = `WDR_${userId}_${Date.now()}`;
 
+  // First, get the bank name from the bank code
   const bank = await db.collection("banks").doc(bankCode).get();
   let bankName = "Unknown Bank";
 
   if (bank.exists) {
     bankName = bank.data().name;
   } else {
+    // If we don't have the bank name, we need to fetch it from KoraPay
     try {
       const banksRes = await fetch(
         "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
@@ -1701,6 +1728,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
         const bankInfo = banksData.data.find((b) => b.code === bankCode);
         if (bankInfo) {
           bankName = bankInfo.name;
+          // Cache the bank name for future use
           await db.collection("banks").doc(bankCode).set({
             name: bankInfo.name,
             code: bankCode,
@@ -1714,10 +1742,12 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
   const batch = db.batch();
 
+  // Deduct from wallet
   batch.update(db.collection("users").doc(userId), {
     walletBalance: admin.firestore.FieldValue.increment(-totalAmount),
   });
 
+  // Create withdrawal request
   batch.set(db.collection("withdrawalRequests").doc(reference), {
     userId,
     reference,
@@ -1734,6 +1764,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  // Create user transaction record
   batch.set(
     db
       .collection("users")
@@ -1753,6 +1784,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
   await batch.commit();
 
+  // Prepare the disbursement request according to KoraPay docs
   const disbursementData = {
     reference,
     destination: {
@@ -1803,6 +1835,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
     if (!koraRes.ok || !koraData.status) {
       console.error("KoraPay disbursement failed:", koraData);
 
+      // Refund on failure
       const refundBatch = db.batch();
       refundBatch.update(db.collection("users").doc(userId), {
         walletBalance: admin.firestore.FieldValue.increment(totalAmount),
@@ -1828,6 +1861,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
       });
     }
 
+    // Update with KoraPay transaction details
     await db
       .collection("withdrawalRequests")
       .doc(reference)
@@ -1846,6 +1880,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
   } catch (error) {
     console.error("KoraPay network error:", error);
 
+    // Refund on network error
     const refundBatch = db.batch();
     refundBatch.update(db.collection("users").doc(userId), {
       walletBalance: admin.firestore.FieldValue.increment(totalAmount),
@@ -1888,6 +1923,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
 
   const { bvn, firstName, lastName, middleName, phone, dob, gender } = req.body;
 
+  // Validate required fields
   if (!bvn || !firstName || !lastName) {
     return res.status(400).json({
       success: false,
@@ -1905,6 +1941,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
   try {
     console.log("Starting BVN verification for user:", userId);
 
+    // Get user data from Firestore
     const userDoc = await db.collection("users").doc(userId).get();
     if (!userDoc.exists) {
       return res.status(404).json({
@@ -1915,6 +1952,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
 
     const userData = userDoc.data();
 
+    // Check if KYC is already approved
     if (userData.kycStatus === "approved") {
       return res.status(400).json({
         success: false,
@@ -1922,6 +1960,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
       });
     }
 
+    // Call KoraPay BVN verification API
     console.log("Calling KoraPay BVN verification...");
     const koraRes = await fetch(
       "https://api.korapay.com/merchant/api/v1/identities/ng/bvn",
@@ -1944,6 +1983,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
     if (!koraRes.ok || !koraData.status) {
       console.error("KoraPay BVN verification failed:", koraData);
 
+      // Update user KYC status to rejected
       await db
         .collection("users")
         .doc(userId)
@@ -1960,9 +2000,11 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
       });
     }
 
+    // BVN verification successful - validate returned data matches user input
     const bvnData = koraData.data;
     const validationErrors = [];
 
+    // Validate first name (case insensitive, allow for minor variations)
     if (
       !bvnData.first_name ||
       !bvnData.first_name.toLowerCase().includes(firstName.toLowerCase())
@@ -1970,6 +2012,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
       validationErrors.push("First name doesn't match BVN records");
     }
 
+    // Validate last name (case insensitive, allow for minor variations)
     if (
       !bvnData.last_name ||
       !bvnData.last_name.toLowerCase().includes(lastName.toLowerCase())
@@ -1977,6 +2020,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
       validationErrors.push("Last name doesn't match BVN records");
     }
 
+    // Validate date of birth if provided
     if (dob && bvnData.date_of_birth && dob !== bvnData.date_of_birth) {
       validationErrors.push("Date of birth doesn't match BVN records");
     }
@@ -2005,6 +2049,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
       });
     }
 
+    // KYC successful - update user KYC status only
     const fullName = middleName
       ? `${firstName} ${middleName} ${lastName}`
       : `${firstName} ${lastName}`;
@@ -2019,7 +2064,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
         phone: phone || null,
         dob: dob || null,
         gender: gender || null,
-        bvn: bvn,
+        bvn: bvn, // Store securely
         verifiedAt: new Date().toISOString(),
       },
       bvnVerificationData: {
@@ -2052,6 +2097,7 @@ app.post("/api/kyc/verify-bvn", async (req, res) => {
   } catch (error) {
     console.error("KYC verification error:", error);
 
+    // Update user KYC status to rejected on error
     try {
       await db.collection("users").doc(userId).update({
         kycStatus: "rejected",
@@ -2142,7 +2188,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Kora Webhook: https://higestdata-proxy.onrender.com/webhook/kora`
   );
-  console.log(`VTU Webhook: https://higestdata-proxy.onrender.com/webhook/vtu`);
   console.log(`Health Check: https://higestdata-proxy.onrender.com/health`);
-  console.log(`VTU Africa API: Integrated and Ready`);
 });
