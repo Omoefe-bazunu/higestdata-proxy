@@ -5,6 +5,18 @@ const crypto = require("crypto");
 require("dotenv").config();
 const admin = require("firebase-admin");
 
+// Add these Firestore imports
+const {
+  getFirestore,
+  doc,
+  getDoc,
+  collection,
+  setDoc,
+  updateDoc,
+  increment,
+  serverTimestamp,
+} = require("firebase-admin/firestore");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -156,9 +168,10 @@ app.post("/api/airtime/purchase", async (req, res) => {
     const userData = userDoc.data();
 
     // Get airtime rates to calculate discount
-    const airtimeRatesDoc = await getDoc(
-      doc(firestore, "settings", "airtimeRates")
-    );
+    const airtimeRatesDoc = await db
+      .collection("settings")
+      .doc("airtimeRates")
+      .get();
     const airtimeRates = airtimeRatesDoc.exists()
       ? airtimeRatesDoc.data().rates
       : {};
@@ -262,7 +275,7 @@ app.post("/api/data/purchase", async (req, res) => {
     const userData = userDoc.data();
 
     // Get data rates to find the plan price
-    const dataRatesDoc = await getDoc(doc(firestore, "settings", "dataRates"));
+    const dataRatesDoc = await db.collection("settings").doc("dataRates").get();
     const dataRates = dataRatesDoc.exists() ? dataRatesDoc.data().rates : {};
 
     const planData = dataRates[service]?.plans?.[DataPlan];
@@ -367,7 +380,7 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     const userData = userDoc.data();
 
     // Get TV rates to find the plan price
-    const tvRatesDoc = await getDoc(doc(firestore, "settings", "tvRates"));
+    const tvRatesDoc = await db.collection("settings").doc("tvRates").get();
     const tvRates = tvRatesDoc.exists() ? tvRatesDoc.data().rates : {};
 
     const planData = tvRates[service]?.plans?.[variation];
@@ -475,9 +488,10 @@ app.post("/api/electricity/purchase", async (req, res) => {
 
     // For electricity, we might have a small service charge
     // You can configure this in settings if needed
-    const electricityRatesDoc = await getDoc(
-      doc(firestore, "settings", "electricityRates")
-    );
+    const electricityRatesDoc = await db
+      .collection("settings")
+      .doc("electricityRates")
+      .get();
     const electricityRates = electricityRatesDoc.exists()
       ? electricityRatesDoc.data()
       : {};
@@ -585,7 +599,7 @@ app.post("/api/exam/purchase", async (req, res) => {
 
     // For exam cards, we might have a profit margin
     // You can configure exam card rates in settings
-    const examRatesDoc = await getDoc(doc(firestore, "settings", "examRates"));
+    const examRatesDoc = await db.collection("settings").doc("examRates").get();
     const examRates = examRatesDoc.exists() ? examRatesDoc.data() : {};
 
     const profitPercentage = examRates.profitMargin || 0; // Default 0% if not set
@@ -866,9 +880,10 @@ app.post("/api/betting/fund", async (req, res) => {
     const userData = userDoc.data();
 
     // Get betting rates to calculate service charge
-    const bettingRatesDoc = await getDoc(
-      doc(firestore, "settings", "bettingRates")
-    );
+    const bettingRatesDoc = await db
+      .collection("settings")
+      .doc("bettingRates")
+      .get();
     const bettingRates = bettingRatesDoc.exists() ? bettingRatesDoc.data() : {};
 
     const serviceCharge = parseFloat(bettingRates.serviceCharge) || 0;
