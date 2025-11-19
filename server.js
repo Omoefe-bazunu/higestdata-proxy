@@ -1020,7 +1020,7 @@ app.post("/webhook/vtu", async (req, res) => {
 });
 
 // ==================== KORA PAYMENT ENDPOINTS ====================
-// === KORA: Initialize Payment ===
+// === KORA: Initialize Payment (Bank Transfer Only) ===
 app.post("/api/kora/initialize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -1039,17 +1039,11 @@ app.post("/api/kora/initialize", async (req, res) => {
     return res.status(400).json({ error: "Minimum ₦100" });
 
   try {
-    console.log("Initializing payment for user:", userId, "amount:", amount);
-
     const userSnap = await db.collection("users").doc(userId).get();
     const userData = userSnap.data();
-
-    if (!userData) {
-      return res.status(404).json({ error: "User not found" });
-    }
+    if (!userData) return res.status(404).json({ error: "User not found" });
 
     const reference = `KRA_${userId}_${Date.now()}`;
-    console.log("Creating transaction with reference:", reference);
 
     await db
       .collection("koraTransactions")
@@ -1064,7 +1058,7 @@ app.post("/api/kora/initialize", async (req, res) => {
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-    const responseData = {
+    res.json({
       publicKey: KORA_PUBLIC_KEY,
       reference,
       amount: Number(amount),
@@ -1073,11 +1067,9 @@ app.post("/api/kora/initialize", async (req, res) => {
         name: userData.fullName || "Customer",
         email: userData.email,
       },
-    };
-
-    console.log("Sending initialization response:", responseData);
-
-    res.json(responseData);
+      channels: ["bank_transfer"], // ← Only bank transfer
+      default_channel: "bank_transfer", // ← Default = bank transfer
+    });
   } catch (error) {
     console.error("Kora init error:", error);
     res.status(500).json({ error: "Failed to initialize payment" });
