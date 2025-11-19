@@ -131,6 +131,7 @@ async function makeVtuAfricaRequest(endpoint, params) {
 }
 
 // === AIRTIME PURCHASE ===
+// === AIRTIME PURCHASE ===
 app.post("/api/airtime/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -154,49 +155,74 @@ app.post("/api/airtime/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    if (amount > userData.walletBalance) {
+    // Get airtime rates to calculate discount
+    const airtimeRatesDoc = await getDoc(
+      doc(firestore, "settings", "airtimeRates")
+    );
+    const airtimeRates = airtimeRatesDoc.exists()
+      ? airtimeRatesDoc.data().rates
+      : {};
+
+    const discountPercentage = airtimeRates[network]?.discountPercentage || 0;
+    const amountToVTU = parseFloat(amount); // Full amount sent to VTU Africa
+    const amountToDeduct = amountToVTU * (1 - discountPercentage / 100); // Discounted amount from wallet
+
+    console.log(
+      `Airtime purchase: VTU Amount: ${amountToVTU}, Discount: ${discountPercentage}%, Wallet Deduction: ${amountToDeduct}`
+    );
+
+    // Check wallet balance against discounted amount
+    if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call
+    // Make VTU Africa API call with full amount
     const vtuResponse = await makeVtuAfricaRequest("airtime", {
-      network,
+      network: network.toLowerCase(),
       phone,
-      amount,
+      amount: amountToVTU,
       ref,
     });
 
-    if (vtuResponse.code === 101) {
-      // Deduct from wallet
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amount),
-        });
+    console.log("VTU Africa Airtime Response:", vtuResponse);
 
-      // Record transaction
-      await db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .add({
+    if (vtuResponse.code === 101) {
+      // Deduct DISCOUNTED amount from wallet, not full amount
+      const batch = db.batch();
+
+      batch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
+      });
+
+      // Record transaction with both amounts
+      batch.set(
+        db.collection("users").doc(userId).collection("transactions").doc(),
+        {
           userId,
           type: "airtime",
           network,
           phone,
-          amount,
+          amountToVTU: amountToVTU, // Full amount sent to VTU
+          amountCharged: amountToDeduct, // Actual amount deducted from wallet
+          discountPercentage: discountPercentage,
           reference: ref,
           status: "success",
-          description: `${network} Airtime to ${phone}`,
+          description: `${network} Airtime to ${phone} (${discountPercentage}% discount)`,
           vtuResponse: vtuResponse,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        }
+      );
+
+      await batch.commit();
 
       res.json({
         success: true,
         message: "Airtime purchase successful",
-        data: vtuResponse,
+        data: {
+          ...vtuResponse,
+          walletDeduction: amountToDeduct,
+          discountApplied: discountPercentage,
+        },
       });
     } else {
       res.status(400).json({
@@ -210,6 +236,7 @@ app.post("/api/airtime/purchase", async (req, res) => {
   }
 });
 
+// === DATA PURCHASE ===
 // === DATA PURCHASE ===
 app.post("/api/data/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -234,7 +261,31 @@ app.post("/api/data/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Make VTU Africa API call
+    // Get data rates to find the plan price
+    const dataRatesDoc = await getDoc(doc(firestore, "settings", "dataRates"));
+    const dataRates = dataRatesDoc.exists() ? dataRatesDoc.data().rates : {};
+
+    const planData = dataRates[service]?.plans?.[DataPlan];
+
+    if (!planData) {
+      return res.status(400).json({ error: "Invalid data plan selected" });
+    }
+
+    const amountToVTU = parseFloat(planData.basePrice); // Base price to VTU Africa
+    const amountToDeduct = parseFloat(planData.finalPrice); // Final price with profit (what user pays)
+
+    console.log(
+      `Data purchase: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
+        amountToDeduct - amountToVTU
+      }`
+    );
+
+    // Check wallet balance against final price (with profit)
+    if (amountToDeduct > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // Make VTU Africa API call with base price
     const vtuResponse = await makeVtuAfricaRequest("data", {
       service,
       MobileNumber,
@@ -245,15 +296,15 @@ app.post("/api/data/purchase", async (req, res) => {
     if (vtuResponse.code === 101) {
       const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
 
-      // Deduct from wallet
+      // Deduct FINAL PRICE (with profit) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction
+      // Record transaction with both amounts
       await db
         .collection("users")
         .doc(userId)
@@ -264,7 +315,9 @@ app.post("/api/data/purchase", async (req, res) => {
           service,
           phone: MobileNumber,
           dataPlan: DataPlan,
-          amount: amountCharged,
+          amountToVTU: amountToVTU, // Base price sent to VTU
+          amountCharged: amountToDeduct, // Final price user paid (with profit)
+          profit: amountToDeduct - amountToVTU, // Your profit margin
           reference: ref,
           status: "success",
           description: `${service} Data to ${MobileNumber}`,
@@ -313,7 +366,31 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Make VTU Africa API call
+    // Get TV rates to find the plan price
+    const tvRatesDoc = await getDoc(doc(firestore, "settings", "tvRates"));
+    const tvRates = tvRatesDoc.exists() ? tvRatesDoc.data().rates : {};
+
+    const planData = tvRates[service]?.plans?.[variation];
+
+    if (!planData) {
+      return res.status(400).json({ error: "Invalid TV plan selected" });
+    }
+
+    const amountToVTU = parseFloat(planData.basePrice); // Base price to VTU Africa
+    const amountToDeduct = parseFloat(planData.finalPrice); // Final price with profit (what user pays)
+
+    console.log(
+      `Cable TV purchase: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
+        amountToDeduct - amountToVTU
+      }`
+    );
+
+    // Check wallet balance against final price (with profit)
+    if (amountToDeduct > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // Make VTU Africa API call with base price
     const vtuResponse = await makeVtuAfricaRequest("paytv", {
       service,
       smartNo,
@@ -324,15 +401,15 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     if (vtuResponse.code === 101) {
       const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
 
-      // Deduct from wallet
+      // Deduct FINAL PRICE (with profit) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction
+      // Record transaction with both amounts
       await db
         .collection("users")
         .doc(userId)
@@ -343,7 +420,9 @@ app.post("/api/cabletv/purchase", async (req, res) => {
           service,
           smartCard: smartNo,
           variation,
-          amount: amountCharged,
+          amountToVTU: amountToVTU, // Base price sent to VTU
+          amountCharged: amountToDeduct, // Final price user paid (with profit)
+          profit: amountToDeduct - amountToVTU, // Your profit margin
           reference: ref,
           status: "success",
           description: `${service} Subscription for ${smartNo}`,
@@ -370,6 +449,7 @@ app.post("/api/cabletv/purchase", async (req, res) => {
 });
 
 // === ELECTRICITY BILL PAYMENT ===
+// === ELECTRICITY BILL PAYMENT ===
 app.post("/api/electricity/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -393,31 +473,52 @@ app.post("/api/electricity/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    if (amount > userData.walletBalance) {
+    // For electricity, we might have a small service charge
+    // You can configure this in settings if needed
+    const electricityRatesDoc = await getDoc(
+      doc(firestore, "settings", "electricityRates")
+    );
+    const electricityRates = electricityRatesDoc.exists()
+      ? electricityRatesDoc.data()
+      : {};
+
+    const serviceChargePercentage = electricityRates.serviceCharge || 0; // Default 0% if not set
+
+    const amountToVTU = parseFloat(amount); // Amount sent to electricity company
+    const amountToDeduct = amountToVTU * (1 + serviceChargePercentage / 100); // Amount with service charge
+
+    console.log(
+      `Electricity purchase: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Service Charge: ${
+        amountToDeduct - amountToVTU
+      }`
+    );
+
+    // Check wallet balance against total amount (electricity + service charge)
+    if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call
+    // Make VTU Africa API call with electricity amount
     const vtuResponse = await makeVtuAfricaRequest("electric", {
       service,
       meterNo,
       metertype,
-      amount,
+      amount: amountToVTU,
       ref,
     });
 
     if (vtuResponse.code === 101) {
       const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
 
-      // Deduct from wallet
+      // Deduct TOTAL AMOUNT (electricity + service charge) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction
+      // Record transaction with both amounts
       await db
         .collection("users")
         .doc(userId)
@@ -428,7 +529,9 @@ app.post("/api/electricity/purchase", async (req, res) => {
           service,
           meterNumber: meterNo,
           meterType: metertype,
-          amount: amountCharged,
+          amountToVTU: amountToVTU, // Amount sent to electricity company
+          amountCharged: amountToDeduct, // Total amount user paid (with service charge)
+          serviceCharge: amountToDeduct - amountToVTU, // Your service charge
           reference: ref,
           status: "success",
           description: `${service} Bill payment for ${meterNo}`,
@@ -455,6 +558,7 @@ app.post("/api/electricity/purchase", async (req, res) => {
 });
 
 // === EXAM SCRATCH CARDS ===
+// === EXAM SCRATCH CARDS ===
 app.post("/api/exam/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -479,6 +583,13 @@ app.post("/api/exam/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
+    // For exam cards, we might have a profit margin
+    // You can configure exam card rates in settings
+    const examRatesDoc = await getDoc(doc(firestore, "settings", "examRates"));
+    const examRates = examRatesDoc.exists() ? examRatesDoc.data() : {};
+
+    const profitPercentage = examRates.profitMargin || 0; // Default 0% if not set
+
     // Build parameters
     const params = {
       service,
@@ -497,17 +608,31 @@ app.post("/api/exam/purchase", async (req, res) => {
     const vtuResponse = await makeVtuAfricaRequest("exam-pin", params);
 
     if (vtuResponse.code === 101) {
-      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+      const amountChargedByVTU = parseFloat(
+        vtuResponse.description.Amount_Charged
+      );
+      const amountToDeduct = amountChargedByVTU * (1 + profitPercentage / 100); // Amount with profit
 
-      // Deduct from wallet
+      console.log(
+        `Exam card purchase: VTU Amount: ${amountChargedByVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
+          amountToDeduct - amountChargedByVTU
+        }`
+      );
+
+      // Check wallet balance against total amount (VTU cost + profit)
+      if (amountToDeduct > userData.walletBalance) {
+        return res.status(400).json({ error: "Insufficient balance" });
+      }
+
+      // Deduct TOTAL AMOUNT (VTU cost + profit) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction
+      // Record transaction with both amounts
       await db
         .collection("users")
         .doc(userId)
@@ -518,7 +643,9 @@ app.post("/api/exam/purchase", async (req, res) => {
           service,
           productCode: product_code,
           quantity,
-          amount: amountCharged,
+          amountToVTU: amountChargedByVTU, // Amount VTU Africa charged
+          amountCharged: amountToDeduct, // Total amount user paid (with profit)
+          profit: amountToDeduct - amountChargedByVTU, // Your profit margin
           reference: ref,
           status: "success",
           description: `${service} Exam PIN Purchase`,
@@ -714,6 +841,7 @@ app.post("/api/betting/verify", async (req, res) => {
   }
 });
 
+// === BETTING ACCOUNT FUNDING ===
 app.post("/api/betting/fund", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -727,7 +855,7 @@ app.post("/api/betting/fund", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
-  const { service, userid, amount, ref, phone } = req.body;
+  const { service, userid, amount, ref } = req.body;
 
   if (!service || !userid || !amount || !ref) {
     return res.status(400).json({ error: "Missing required parameters" });
@@ -737,28 +865,56 @@ app.post("/api/betting/fund", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Make VTU Africa API call
+    // Get betting rates to calculate service charge
+    const bettingRatesDoc = await getDoc(
+      doc(firestore, "settings", "bettingRates")
+    );
+    const bettingRates = bettingRatesDoc.exists() ? bettingRatesDoc.data() : {};
+
+    const serviceCharge = parseFloat(bettingRates.serviceCharge) || 0;
+    const chargeType = bettingRates.chargeType || "fixed";
+
+    const amountToVTU = parseFloat(amount); // Amount sent to betting account
+    let amountToDeduct = amountToVTU;
+
+    // Calculate service charge
+    if (chargeType === "percentage") {
+      amountToDeduct = amountToVTU + (amountToVTU * serviceCharge) / 100;
+    } else {
+      amountToDeduct = amountToVTU + serviceCharge;
+    }
+
+    console.log(
+      `Betting funding: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Service Charge: ${
+        amountToDeduct - amountToVTU
+      }`
+    );
+
+    // Check wallet balance against total amount (betting + service charge)
+    if (amountToDeduct > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // Make VTU Africa API call with betting amount
     const vtuResponse = await makeVtuAfricaRequest("betpay", {
       service,
       userid,
-      amount,
+      amount: amountToVTU,
       ref,
-      phone,
-      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
     });
 
     if (vtuResponse.code === 101) {
       const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
 
-      // Deduct from wallet
+      // Deduct TOTAL AMOUNT (betting + service charge) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction
+      // Record transaction with both amounts
       await db
         .collection("users")
         .doc(userId)
@@ -768,7 +924,9 @@ app.post("/api/betting/fund", async (req, res) => {
           type: "betting",
           service,
           userid,
-          amount: amountCharged,
+          amountToVTU: amountToVTU, // Amount sent to betting account
+          amountCharged: amountToDeduct, // Total amount user paid (with service charge)
+          serviceCharge: amountToDeduct - amountToVTU, // Your service charge
           reference: ref,
           status: "success",
           description: `${service} Account Funding for ${userid}`,
@@ -800,13 +958,11 @@ app.post("/webhook/vtu", async (req, res) => {
     console.log("VTU Africa Webhook Received:", payload);
 
     // Immediately respond to prevent retries
-    res
-      .status(200)
-      .json({
-        code: 101,
-        status: "Completed",
-        message: "Webhook received successfully",
-      });
+    res.status(200).json({
+      code: 101,
+      status: "Completed",
+      message: "Webhook received successfully",
+    });
 
     // Process webhook based on service type
     if (payload.service === "Airtime2Cash" && payload.status === "Completed") {
