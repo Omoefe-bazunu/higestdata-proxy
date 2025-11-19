@@ -1,4 +1,4 @@
-// server.js - UPDATED WITH COMPLETE WEBHOOK SYSTEM
+// server.js - UPDATED WITH VTU AFRICA API INTEGRATION
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -23,16 +23,11 @@ try {
 }
 
 // === CONFIG ===
-const EBILLS_API_URL =
-  process.env.EBILLS_API_URL || "https://ebills.africa/wp-json/api/v2/";
-const EBILLS_AUTH_URL =
-  process.env.EBILLS_AUTH_URL ||
-  "https://ebills.africa/wp-json/jwt-auth/v1/token";
+const VTU_AFRICA_API_URL = "https://vtuafrica.com.ng/portal/api";
+const VTU_AFRICA_SANDBOX_URL = "https://vtuafrica.com.ng/portal/api-test";
+const VTU_AFRICA_API_KEY = process.env.VTU_AFRICA_API_KEY;
 const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY;
 const KORA_PUBLIC_KEY = process.env.KORA_PUBLIC_KEY;
-const USER_PIN = process.env.EBILLS_USER_PIN;
-
-let token = null;
 
 // === RESEND EMAIL FUNCTION ===
 async function sendEmail(to, subject, html) {
@@ -105,24 +100,745 @@ async function verifyFirebaseToken(idToken) {
   }
 }
 
-// === eBILLS AUTH ===
-async function getAccessToken() {
-  if (token) return token;
-  const res = await fetch(EBILLS_AUTH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: process.env.EBILLS_USERNAME,
-      password: process.env.EBILLS_PASSWORD,
-    }),
-  });
-  if (!res.ok) throw new Error("eBills auth failed");
-  const data = await res.json();
-  token = data.token;
-  return token;
+// === VTU AFRICA HELPER FUNCTION ===
+async function makeVtuAfricaRequest(endpoint, params) {
+  try {
+    const baseParams = {
+      apikey: VTU_AFRICA_API_KEY,
+      ...params,
+    };
+
+    const queryString = new URLSearchParams(baseParams).toString();
+    const url = `${VTU_AFRICA_API_URL}/${endpoint}/?${queryString}`;
+
+    console.log(`VTU Africa Request: ${url}`);
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    const data = await response.json();
+    console.log(`VTU Africa Response:`, data);
+
+    return data;
+  } catch (error) {
+    console.error("VTU Africa API Error:", error);
+    throw new Error(`VTU Africa API request failed: ${error.message}`);
+  }
 }
 
-// === KORA: Initialize Payment ===
+// === AIRTIME PURCHASE ===
+app.post("/api/airtime/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { network, phone, amount, ref } = req.body;
+
+  if (!network || !phone || !amount || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    if (amount > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("airtime", {
+      network,
+      phone,
+      amount,
+      ref,
+    });
+
+    if (vtuResponse.code === 101) {
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amount),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "airtime",
+          network,
+          phone,
+          amount,
+          reference: ref,
+          status: "success",
+          description: `${network} Airtime to ${phone}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Airtime purchase successful",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Airtime purchase failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Airtime purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === DATA PURCHASE ===
+app.post("/api/data/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, MobileNumber, DataPlan, ref } = req.body;
+
+  if (!service || !MobileNumber || !DataPlan || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("data", {
+      service,
+      MobileNumber,
+      DataPlan,
+      ref,
+    });
+
+    if (vtuResponse.code === 101) {
+      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "data",
+          service,
+          phone: MobileNumber,
+          dataPlan: DataPlan,
+          amount: amountCharged,
+          reference: ref,
+          status: "success",
+          description: `${service} Data to ${MobileNumber}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Data purchase successful",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Data purchase failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Data purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === CABLE TV SUBSCRIPTION ===
+app.post("/api/cabletv/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, smartNo, variation, ref } = req.body;
+
+  if (!service || !smartNo || !variation || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("paytv", {
+      service,
+      smartNo,
+      variation,
+      ref,
+    });
+
+    if (vtuResponse.code === 101) {
+      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "cabletv",
+          service,
+          smartCard: smartNo,
+          variation,
+          amount: amountCharged,
+          reference: ref,
+          status: "success",
+          description: `${service} Subscription for ${smartNo}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Cable TV subscription successful",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message || "Cable TV subscription failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Cable TV purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === ELECTRICITY BILL PAYMENT ===
+app.post("/api/electricity/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, meterNo, metertype, amount, ref } = req.body;
+
+  if (!service || !meterNo || !metertype || !amount || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    if (amount > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("electric", {
+      service,
+      meterNo,
+      metertype,
+      amount,
+      ref,
+    });
+
+    if (vtuResponse.code === 101) {
+      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "electricity",
+          service,
+          meterNumber: meterNo,
+          meterType: metertype,
+          amount: amountCharged,
+          reference: ref,
+          status: "success",
+          description: `${service} Bill payment for ${meterNo}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Electricity bill payment successful",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message || "Electricity bill payment failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Electricity purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === EXAM SCRATCH CARDS ===
+app.post("/api/exam/purchase", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, product_code, quantity, ref, profilecode, sender, phone } =
+    req.body;
+
+  if (!service || !product_code || !quantity || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Build parameters
+    const params = {
+      service,
+      product_code,
+      quantity,
+      ref,
+      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
+    };
+
+    // Add optional parameters if provided
+    if (profilecode) params.profilecode = profilecode;
+    if (sender) params.sender = sender;
+    if (phone) params.phone = phone;
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("exam-pin", params);
+
+    if (vtuResponse.code === 101) {
+      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "exam",
+          service,
+          productCode: product_code,
+          quantity,
+          amount: amountCharged,
+          reference: ref,
+          status: "success",
+          description: `${service} Exam PIN Purchase`,
+          vtuResponse: vtuResponse,
+          pins: vtuResponse.description.pins,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Exam PIN purchase successful",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Exam PIN purchase failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Exam PIN purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === AIRTIME TO CASH CONVERSION ===
+app.post("/api/airtime-cash/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { network } = req.body;
+
+  if (!network) {
+    return res.status(400).json({ error: "Network parameter required" });
+  }
+
+  try {
+    // Make VTU Africa verification call
+    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
+      serviceName: "Airtime2Cash",
+      network,
+    });
+
+    if (vtuResponse.code === 101) {
+      res.json({
+        success: true,
+        message: "Airtime to cash service available",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message ||
+          "Airtime to cash service not available",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Airtime cash verification error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/airtime-cash/convert", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { network, sender, sendernumber, amount, ref, sitephone } = req.body;
+
+  if (!network || !sender || !sendernumber || !amount || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Build parameters
+    const params = {
+      network,
+      sender,
+      sendernumber,
+      amount,
+      ref,
+      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
+    };
+
+    if (sitephone) params.sitephone = sitephone;
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("airtime-cash", params);
+
+    if (vtuResponse.code === 101) {
+      // Record transaction (no wallet deduction as user sends airtime directly)
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "airtime_cash",
+          network,
+          sender,
+          sendernumber,
+          amount,
+          reference: ref,
+          status: "processing",
+          description: `Airtime to Cash conversion for ${sendernumber}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Airtime conversion request received",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Airtime conversion failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Airtime cash conversion error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === BETTING VERIFICATION ===
+app.post("/api/betting/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, userid } = req.body;
+
+  if (!service || !userid) {
+    return res.status(400).json({ error: "Service and user ID required" });
+  }
+
+  try {
+    // Make VTU Africa verification call
+    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
+      serviceName: "Betting",
+      service,
+      userid,
+    });
+
+    if (vtuResponse.code === 101) {
+      res.json({
+        success: true,
+        message: "Betting account verified",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message ||
+          "Betting account verification failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Betting verification error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/betting/fund", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { service, userid, amount, ref, phone } = req.body;
+
+  if (!service || !userid || !amount || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("betpay", {
+      service,
+      userid,
+      amount,
+      ref,
+      phone,
+      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
+    });
+
+    if (vtuResponse.code === 101) {
+      const amountCharged = parseFloat(vtuResponse.description.Amount_Charged);
+
+      // Deduct from wallet
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          walletBalance: admin.firestore.FieldValue.increment(-amountCharged),
+        });
+
+      // Record transaction
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .add({
+          userId,
+          type: "betting",
+          service,
+          userid,
+          amount: amountCharged,
+          reference: ref,
+          status: "success",
+          description: `${service} Account Funding for ${userid}`,
+          vtuResponse: vtuResponse,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        success: true,
+        message: "Betting account funded successfully",
+        data: vtuResponse,
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Betting funding failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Betting funding error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === VTU AFRICA WEBHOOK HANDLER ===
+app.post("/webhook/vtu", async (req, res) => {
+  try {
+    const payload = req.body;
+    console.log("VTU Africa Webhook Received:", payload);
+
+    // Immediately respond to prevent retries
+    res
+      .status(200)
+      .json({
+        code: 101,
+        status: "Completed",
+        message: "Webhook received successfully",
+      });
+
+    // Process webhook based on service type
+    if (payload.service === "Airtime2Cash" && payload.status === "Completed") {
+      // Handle airtime to cash completion
+      const { ref, amount, credit, sender } = payload;
+
+      // Find and update the transaction
+      const transactionsSnapshot = await db
+        .collectionGroup("transactions")
+        .where("reference", "==", ref)
+        .where("type", "==", "airtime_cash")
+        .get();
+
+      if (!transactionsSnapshot.empty) {
+        const batch = db.batch();
+        transactionsSnapshot.forEach((doc) => {
+          batch.update(doc.ref, {
+            status: "completed",
+            creditAmount: credit,
+            webhookProcessed: true,
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        await batch.commit();
+        console.log(`Airtime to cash completed for ref: ${ref}`);
+      }
+    }
+  } catch (error) {
+    console.error("VTU Africa webhook processing error:", error);
+  }
+});
+
 // === KORA: Initialize Payment ===
 app.post("/api/kora/initialize", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -572,45 +1288,6 @@ async function handlePayoutFailed(data) {
   }
 }
 
-// === WEBHOOK FOR eBILLS (async transactions) ===
-app.post("/webhook", async (req, res) => {
-  const signature = req.headers["x-signature"];
-  const payload = req.rawBody.toString();
-  const hash = crypto
-    .createHmac("sha256", USER_PIN)
-    .update(payload)
-    .digest("hex");
-  if (hash !== signature) return res.status(403).json({ error: "Invalid sig" });
-
-  const { request_id, status } = req.body;
-  const snapshot = await db
-    .collectionGroup("transactions")
-    .where("requestId", "==", request_id)
-    .where("pending", "==", true)
-    .get();
-
-  if (snapshot.empty) return res.json({ status: "no pending txn" });
-
-  const batch = db.batch();
-  snapshot.forEach((doc) => {
-    const data = doc.data();
-    const isSuccess = ["completed-api", "ORDER COMPLETED", "success"].includes(
-      status
-    );
-    if (isSuccess) {
-      batch.update(doc.ref, { status: "success", pending: false });
-      batch.update(db.collection("users").doc(data.userId), {
-        walletBalance: admin.firestore.FieldValue.increment(-data.amount),
-      });
-    } else {
-      batch.update(doc.ref, { status: "failed", pending: false });
-    }
-  });
-
-  await batch.commit();
-  res.json({ status: "success" });
-});
-
 // === WITHDRAWAL: Send OTP ===
 app.post("/api/withdrawal/send-otp", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -705,7 +1382,7 @@ app.get("/api/banks", async (req, res) => {
       "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
       {
         headers: {
-          Authorization: `Bearer ${KORA_PUBLIC_KEY}`, // Use PUBLIC key for this endpoint
+          Authorization: `Bearer ${KORA_PUBLIC_KEY}`,
           "Content-Type": "application/json",
         },
       }
@@ -717,7 +1394,6 @@ app.get("/api/banks", async (req, res) => {
     console.log("KoraPay banks response data received");
 
     if (koraRes.ok && data.status) {
-      // Format the banks data to match what the frontend expects
       const formattedBanks = data.data.map((bank) => ({
         code: bank.code,
         name: bank.name,
@@ -766,7 +1442,7 @@ app.post("/api/resolve-account", async (req, res) => {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${KORA_SECRET_KEY}`, // Use SECRET key for this endpoint
+          Authorization: `Bearer ${KORA_SECRET_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -832,14 +1508,45 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
   const reference = `WDR_${userId}_${Date.now()}`;
 
+  const bank = await db.collection("banks").doc(bankCode).get();
+  let bankName = "Unknown Bank";
+
+  if (bank.exists) {
+    bankName = bank.data().name;
+  } else {
+    try {
+      const banksRes = await fetch(
+        "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
+        {
+          headers: {
+            Authorization: `Bearer ${KORA_PUBLIC_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const banksData = await banksRes.json();
+      if (banksData.status) {
+        const bankInfo = banksData.data.find((b) => b.code === bankCode);
+        if (bankInfo) {
+          bankName = bankInfo.name;
+          await db.collection("banks").doc(bankCode).set({
+            name: bankInfo.name,
+            code: bankCode,
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Failed to fetch bank name:", error);
+    }
+  }
+
   const batch = db.batch();
 
-  // Deduct from wallet
   batch.update(db.collection("users").doc(userId), {
     walletBalance: admin.firestore.FieldValue.increment(-totalAmount),
   });
 
-  // Create withdrawal request
   batch.set(db.collection("withdrawalRequests").doc(reference), {
     userId,
     reference,
@@ -847,6 +1554,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
     totalAmount,
     fee: FEE,
     bankCode,
+    bankName,
     accountNumber,
     accountName,
     status: "processing",
@@ -855,7 +1563,6 @@ app.post("/api/withdrawal/process", async (req, res) => {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  // Create user transaction record
   batch.set(
     db
       .collection("users")
@@ -875,7 +1582,34 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
   await batch.commit();
 
-  // Initiate payout via Kora
+  const disbursementData = {
+    reference,
+    destination: {
+      type: "bank_account",
+      amount: withdrawalAmount,
+      currency: "NGN",
+      narration: "Withdrawal from Highest Data",
+      bank_account: {
+        bank_name: bankName,
+        account: accountNumber,
+        account_name: accountName,
+        beneficiary_type: "individual",
+        first_name: accountName.split(" ")[0] || accountName,
+        last_name: accountName.split(" ").slice(1).join(" ") || accountName,
+        account_number_type: "account_number",
+      },
+      customer: {
+        name: userData.fullName || userData.email,
+        email: userData.email,
+      },
+    },
+  };
+
+  console.log(
+    "Sending disbursement request:",
+    JSON.stringify(disbursementData, null, 2)
+  );
+
   try {
     const koraRes = await fetch(
       "https://api.korapay.com/merchant/api/v1/transactions/disburse",
@@ -885,31 +1619,19 @@ app.post("/api/withdrawal/process", async (req, res) => {
           Authorization: `Bearer ${KORA_SECRET_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          reference,
-          destination: {
-            type: "bank_account",
-            amount: withdrawalAmount,
-            currency: "NGN",
-            narration: "Withdrawal from Highest Data",
-            bank_account: {
-              bank: bankCode,
-              account: accountNumber,
-              account_name: accountName,
-            },
-          },
-          customer: {
-            name: userData.fullName || userData.email,
-            email: userData.email,
-          },
-        }),
+        body: JSON.stringify(disbursementData),
       }
     );
 
     const koraData = await koraRes.json();
+    console.log(
+      "KoraPay disbursement response:",
+      JSON.stringify(koraData, null, 2)
+    );
 
-    if (!koraData.status) {
-      // Refund on immediate failure
+    if (!koraRes.ok || !koraData.status) {
+      console.error("KoraPay disbursement failed:", koraData);
+
       const refundBatch = db.batch();
       refundBatch.update(db.collection("users").doc(userId), {
         walletBalance: admin.firestore.FieldValue.increment(totalAmount),
@@ -917,6 +1639,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
       refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
         status: "failed",
         failureReason: koraData.message || "Payout initiation failed",
+        failedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       refundBatch.update(
         db
@@ -930,18 +1653,28 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
       return res.status(400).json({
         error: koraData.message || "Payout failed to initiate",
+        koraError: koraData,
       });
     }
+
+    await db
+      .collection("withdrawalRequests")
+      .doc(reference)
+      .update({
+        koraReference: koraData.data?.reference,
+        koraFee: koraData.data?.fee,
+        status: koraData.data?.status || "processing",
+      });
 
     res.json({
       success: true,
       reference,
       message: "Withdrawal processing started",
+      koraResponse: koraData,
     });
   } catch (error) {
-    console.error("Kora payout initiation error:", error);
+    console.error("KoraPay network error:", error);
 
-    // Refund on network error
     const refundBatch = db.batch();
     refundBatch.update(db.collection("users").doc(userId), {
       walletBalance: admin.firestore.FieldValue.increment(totalAmount),
@@ -949,6 +1682,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
     refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
       status: "failed",
       failureReason: "Network error during payout initiation",
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     refundBatch.update(
       db
@@ -960,7 +1694,254 @@ app.post("/api/withdrawal/process", async (req, res) => {
     );
     await refundBatch.commit();
 
-    res.status(500).json({ error: "Failed to initiate payout" });
+    res.status(500).json({
+      error: "Failed to initiate payout due to network error",
+      details: error.message,
+    });
+  }
+});
+
+// === KYC: BVN VERIFICATION WITH KORAPAY ===
+app.post("/api/kyc/verify-bvn", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  const { bvn, firstName, lastName, middleName, phone, dob, gender } = req.body;
+
+  if (!bvn || !firstName || !lastName) {
+    return res.status(400).json({
+      success: false,
+      error: "BVN, first name, and last name are required",
+    });
+  }
+
+  if (bvn.length !== 11 || !/^\d+$/.test(bvn)) {
+    return res.status(400).json({
+      success: false,
+      error: "BVN must be exactly 11 digits",
+    });
+  }
+
+  try {
+    console.log("Starting BVN verification for user:", userId);
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    const userData = userDoc.data();
+
+    if (userData.kycStatus === "approved") {
+      return res.status(400).json({
+        success: false,
+        error: "KYC already approved",
+      });
+    }
+
+    console.log("Calling KoraPay BVN verification...");
+    const koraRes = await fetch(
+      "https://api.korapay.com/merchant/api/v1/identities/ng/bvn",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${KORA_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: bvn,
+          verification_consent: true,
+        }),
+      }
+    );
+
+    const koraData = await koraRes.json();
+    console.log("KoraPay BVN response:", JSON.stringify(koraData, null, 2));
+
+    if (!koraRes.ok || !koraData.status) {
+      console.error("KoraPay BVN verification failed:", koraData);
+
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          kycStatus: "rejected",
+          rejectionReason: koraData.message || "BVN verification failed",
+          lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      return res.status(400).json({
+        success: false,
+        error: koraData.message || "BVN verification failed",
+        koraError: koraData,
+      });
+    }
+
+    const bvnData = koraData.data;
+    const validationErrors = [];
+
+    if (
+      !bvnData.first_name ||
+      !bvnData.first_name.toLowerCase().includes(firstName.toLowerCase())
+    ) {
+      validationErrors.push("First name doesn't match BVN records");
+    }
+
+    if (
+      !bvnData.last_name ||
+      !bvnData.last_name.toLowerCase().includes(lastName.toLowerCase())
+    ) {
+      validationErrors.push("Last name doesn't match BVN records");
+    }
+
+    if (dob && bvnData.date_of_birth && dob !== bvnData.date_of_birth) {
+      validationErrors.push("Date of birth doesn't match BVN records");
+    }
+
+    if (validationErrors.length > 0) {
+      console.error("BVN data validation failed:", validationErrors);
+
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          kycStatus: "rejected",
+          rejectionReason: validationErrors.join(", "),
+          lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      return res.status(400).json({
+        success: false,
+        error: "Information doesn't match BVN records",
+        errors: validationErrors,
+        bvnData: {
+          firstName: bvnData.first_name,
+          lastName: bvnData.last_name,
+          dob: bvnData.date_of_birth,
+        },
+      });
+    }
+
+    const fullName = middleName
+      ? `${firstName} ${middleName} ${lastName}`
+      : `${firstName} ${lastName}`;
+
+    const updateData = {
+      kycStatus: "approved",
+      displayName: fullName,
+      kycData: {
+        firstName,
+        lastName,
+        middleName: middleName || null,
+        phone: phone || null,
+        dob: dob || null,
+        gender: gender || null,
+        bvn: bvn,
+        verifiedAt: new Date().toISOString(),
+      },
+      bvnVerificationData: {
+        reference: bvnData.reference,
+        koraVerifiedAt: new Date().toISOString(),
+        bvnFirstname: bvnData.first_name,
+        bvnLastname: bvnData.last_name,
+        bvnDob: bvnData.date_of_birth,
+        bvnPhone: bvnData.phone_number,
+        bvnGender: bvnData.gender,
+      },
+      lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await db.collection("users").doc(userId).update(updateData);
+
+    console.log("KYC approved for user:", userId);
+
+    res.json({
+      success: true,
+      message: "KYC verification successful",
+      data: {
+        reference: bvnData.reference,
+        firstName: bvnData.first_name,
+        lastName: bvnData.last_name,
+        dob: bvnData.date_of_birth,
+        phone: bvnData.phone_number,
+      },
+    });
+  } catch (error) {
+    console.error("KYC verification error:", error);
+
+    try {
+      await db.collection("users").doc(userId).update({
+        kycStatus: "rejected",
+        rejectionReason: "Internal server error during verification",
+        lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (dbError) {
+      console.error("Failed to update user KYC status:", dbError);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: "Internal server error during KYC verification",
+      details: error.message,
+    });
+  }
+});
+
+// === KYC: GET USER KYC STATUS ===
+app.get("/api/kyc/status", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    const userData = userDoc.data();
+
+    res.json({
+      success: true,
+      data: {
+        kycStatus: userData.kycStatus || "pending",
+        displayName: userData.displayName,
+        email: userData.email,
+        kycData: userData.kycData || null,
+        rejectionReason: userData.rejectionReason || null,
+        lastKycAttempt: userData.lastKycAttempt || null,
+      },
+    });
+  } catch (error) {
+    console.error("Get KYC status error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to get KYC status",
+    });
   }
 });
 
@@ -970,6 +1951,7 @@ app.get("/health", (req, res) => {
     status: "ok",
     timestamp: new Date().toISOString(),
     service: "Highest Data Backend",
+    vtuProvider: "VTU Africa",
   });
 });
 
@@ -977,7 +1959,7 @@ app.get("/health", (req, res) => {
 app.get("/webhook/test", (req, res) => {
   res.json({
     message: "Webhook endpoint is accessible",
-    url: "/webhook/kora",
+    urls: ["/webhook/kora", "/webhook/vtu"],
     method: "POST",
   });
 });
@@ -989,5 +1971,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Kora Webhook: https://higestdata-proxy.onrender.com/webhook/kora`
   );
+  console.log(`VTU Webhook: https://higestdata-proxy.onrender.com/webhook/vtu`);
   console.log(`Health Check: https://higestdata-proxy.onrender.com/health`);
+  console.log(`VTU Africa API: Integrated and Ready`);
 });
