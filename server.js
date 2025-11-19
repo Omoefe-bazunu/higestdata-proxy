@@ -699,125 +699,6 @@ app.post("/api/exam/purchase", async (req, res) => {
   }
 });
 
-// === AIRTIME TO CASH CONVERSION ===
-app.post("/api/airtime-cash/verify", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const { network } = req.body;
-
-  if (!network) {
-    return res.status(400).json({ error: "Network parameter required" });
-  }
-
-  try {
-    // Make VTU Africa verification call
-    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
-      serviceName: "Airtime2Cash",
-      network,
-    });
-
-    if (vtuResponse.code === 101) {
-      res.json({
-        success: true,
-        message: "Airtime to cash service available",
-        data: vtuResponse,
-      });
-    } else {
-      res.status(400).json({
-        error:
-          vtuResponse.description?.message ||
-          "Airtime to cash service not available",
-        data: vtuResponse,
-      });
-    }
-  } catch (error) {
-    console.error("Airtime cash verification error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post("/api/airtime-cash/convert", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const { network, sender, sendernumber, amount, ref, sitephone } = req.body;
-
-  if (!network || !sender || !sendernumber || !amount || !ref) {
-    return res.status(400).json({ error: "Missing required parameters" });
-  }
-
-  try {
-    // Build parameters
-    const params = {
-      network,
-      sender,
-      sendernumber,
-      amount,
-      ref,
-      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
-    };
-
-    if (sitephone) params.sitephone = sitephone;
-
-    // Make VTU Africa API call
-    const vtuResponse = await makeVtuAfricaRequest("airtime-cash", params);
-
-    if (vtuResponse.code === 101) {
-      // Record transaction (no wallet deduction as user sends airtime directly)
-      await db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .add({
-          userId,
-          type: "airtime_cash",
-          network,
-          sender,
-          sendernumber,
-          amount,
-          reference: ref,
-          status: "processing",
-          description: `Airtime to Cash conversion for ${sendernumber}`,
-          vtuResponse: vtuResponse,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-      res.json({
-        success: true,
-        message: "Airtime conversion request received",
-        data: vtuResponse,
-      });
-    } else {
-      res.status(400).json({
-        error: vtuResponse.description?.message || "Airtime conversion failed",
-        data: vtuResponse,
-      });
-    }
-  } catch (error) {
-    console.error("Airtime cash conversion error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // === BETTING VERIFICATION ===
 app.post("/api/betting/verify", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1055,47 +936,372 @@ app.post("/api/sms/purchase", async (req, res) => {
   }
 });
 
-// === VTU AFRICA WEBHOOK HANDLER ===
+// === AIRTIME TO CASH CONVERSION - CORRECTED ===
+
+// === VERIFY SERVICE AVAILABILITY ===
+app.post("/api/airtime-cash/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { network } = req.body;
+
+  if (!network) {
+    return res.status(400).json({ error: "Network parameter required" });
+  }
+
+  try {
+    // Make VTU Africa verification call
+    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
+      serviceName: "Airtime2Cash",
+      network: network.toLowerCase(),
+    });
+
+    console.log("VTU Africa Verify Response:", vtuResponse);
+
+    if (
+      vtuResponse.code === 101 &&
+      vtuResponse.description?.Status === "Completed"
+    ) {
+      // Extract the phone number from VTU response
+      const vtuPhoneNumber = vtuResponse.description?.Phone_Number;
+      const vtuNetwork = vtuResponse.description?.Network;
+      const message = vtuResponse.description?.message;
+
+      res.json({
+        success: true,
+        message: "Airtime to cash service available",
+        data: {
+          status: vtuResponse.description.Status,
+          phoneNumber: vtuPhoneNumber,
+          network: vtuNetwork,
+          message: message,
+          instructions: message || `Transfer airtime to ${vtuPhoneNumber}`,
+        },
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message ||
+          "Airtime to cash service not available",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Airtime cash verification error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === CONVERT AIRTIME TO CASH ===
+app.post("/api/airtime-cash/convert", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { network, sender, sendernumber, amount, ref, sitephone } = req.body;
+
+  if (!network || !sender || !sendernumber || !amount || !ref) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  // Validate amount
+  const amountValue = parseFloat(amount);
+  if (amountValue < 100) {
+    return res.status(400).json({ error: "Minimum amount is ₦100" });
+  }
+
+  // Glo has maximum of ₦1000 per transfer
+  if (network.toLowerCase() === "glo" && amountValue > 1000) {
+    return res.status(400).json({ error: "Maximum amount for Glo is ₦1000" });
+  }
+
+  try {
+    // Get user data
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Get conversion rates from settings
+    const ratesDoc = await db
+      .collection("settings")
+      .doc("airtimeToCashRates")
+      .get();
+    const rates = ratesDoc.exists ? ratesDoc.data() : {};
+
+    const networkRate = rates[network.toLowerCase()] || {
+      rate: 0.7,
+      charge: 30,
+      enabled: true,
+    };
+
+    // Check if service is enabled for this network
+    if (!networkRate.enabled) {
+      return res.status(400).json({
+        error: `Airtime to cash service is currently disabled for ${network.toUpperCase()}`,
+      });
+    }
+
+    const conversionRate = networkRate.rate;
+    const expectedCredit = amountValue * conversionRate;
+    const serviceFee = amountValue * (1 - conversionRate);
+
+    // Build parameters
+    const params = {
+      network: network.toLowerCase(),
+      sender: sender || userData.email,
+      sendernumber,
+      amount: amountValue,
+      ref,
+      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
+    };
+
+    if (sitephone) params.sitephone = sitephone;
+
+    console.log("Airtime to Cash Request:", params);
+
+    // Make VTU Africa API call
+    const vtuResponse = await makeVtuAfricaRequest("airtime-cash", params);
+
+    console.log("VTU Africa Convert Response:", vtuResponse);
+
+    if (vtuResponse.code === 101) {
+      // Create transaction record (status: processing)
+      const transactionData = {
+        userId,
+        type: "airtime_cash",
+        network: network.toLowerCase(),
+        sender,
+        sendernumber,
+        amount: amountValue,
+        expectedCredit: expectedCredit,
+        serviceFee: serviceFee,
+        conversionRate: conversionRate,
+        reference: ref,
+        status: "processing",
+        description: `Airtime to Cash - ${network.toUpperCase()} ₦${amountValue}`,
+        vtuResponse: vtuResponse.description,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 minutes from now
+      };
+
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .doc(ref)
+        .set(transactionData);
+
+      res.json({
+        success: true,
+        message: "Airtime conversion request received",
+        data: {
+          reference: ref,
+          status: "processing",
+          amount: amountValue,
+          expectedCredit: expectedCredit,
+          serviceFee: serviceFee,
+          network: network.toLowerCase(),
+          message: vtuResponse.description?.message,
+          instructions: `Please transfer ₦${amountValue} airtime within 30 minutes`,
+        },
+      });
+    } else {
+      res.status(400).json({
+        error: vtuResponse.description?.message || "Airtime conversion failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Airtime cash conversion error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === VTU AFRICA WEBHOOK HANDLER - CORRECTED ===
 app.post("/webhook/vtu", async (req, res) => {
   try {
     const payload = req.body;
-    console.log("VTU Africa Webhook Received:", payload);
+    console.log(
+      "VTU Africa Webhook Received:",
+      JSON.stringify(payload, null, 2)
+    );
 
-    // Immediately respond to prevent retries
-    res.status(200).json({
+    // Immediate response as required by VTU Africa
+    res.json({
       code: 101,
       status: "Completed",
       message: "Webhook received successfully",
     });
 
-    // Process webhook based on service type
+    // Process Airtime2Cash webhook
     if (payload.service === "Airtime2Cash" && payload.status === "Completed") {
-      // Handle airtime to cash completion
-      const { ref, amount, credit, sender } = payload;
+      const {
+        ref,
+        credit, // Amount customer receives
+        amount, // Original airtime amount
+        Charge, // Service charge
+        sender, // Customer email/identifier
+        network,
+      } = payload;
 
-      // Find and update the transaction
-      const transactionsSnapshot = await db
+      console.log(
+        `Processing A2C webhook: ref=${ref}, credit=${credit}, amount=${amount}`
+      );
+
+      // Find the transaction
+      const snap = await db
         .collectionGroup("transactions")
         .where("reference", "==", ref)
         .where("type", "==", "airtime_cash")
+        .limit(1)
         .get();
 
-      if (!transactionsSnapshot.empty) {
+      if (!snap.empty) {
+        const txnDoc = snap.docs[0];
+        const txnData = txnDoc.data();
+        const userId = txnData.userId;
+
+        // Check if already processed
+        if (txnData.status === "completed") {
+          console.log(`A2C transaction ${ref} already completed`);
+          return;
+        }
+
+        const creditAmount = parseFloat(credit) || 0;
+
         const batch = db.batch();
-        transactionsSnapshot.forEach((doc) => {
-          batch.update(doc.ref, {
-            status: "completed",
-            creditAmount: credit,
-            webhookProcessed: true,
-            completedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
+
+        // Credit user wallet
+        const userRef = db.collection("users").doc(userId);
+        batch.update(userRef, {
+          walletBalance: admin.firestore.FieldValue.increment(creditAmount),
         });
+
+        // Update transaction status
+        batch.update(txnDoc.ref, {
+          status: "completed",
+          creditAmount: creditAmount,
+          actualCharge: parseFloat(Charge) || 0,
+          webhookPayload: payload,
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
         await batch.commit();
-        console.log(`Airtime to cash completed for ref: ${ref}`);
+
+        console.log(
+          `A2C Success: Credited ₦${creditAmount} to user ${userId} for ref ${ref}`
+        );
+
+        // Get user data for email
+        const userDoc = await db.collection("users").doc(userId).get();
+        const userData = userDoc.data();
+
+        // Send success email
+        await sendEmail(
+          userData.email,
+          "Airtime to Cash Conversion Successful",
+          `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
+            <h2 style="color: #10b981;">Conversion Completed!</h2>
+            <p>Hello <strong>${
+              userData.fullName || userData.email
+            }</strong>,</p>
+            <p>Your airtime to cash conversion has been completed successfully.</p>
+            <div style="background-color: #f3f4f6; padding: 15px; border-radius: 8px; margin: 20px 0;">
+              <p><strong>Network:</strong> ${network?.toUpperCase()}</p>
+              <p><strong>Airtime Sent:</strong> ₦${amount?.toLocaleString()}</p>
+              <p><strong>Amount Credited:</strong> ₦${creditAmount.toLocaleString()}</p>
+              <p><strong>Service Charge:</strong> ₦${parseFloat(
+                Charge || 0
+              ).toLocaleString()}</p>
+              <p><strong>Reference:</strong> ${ref}</p>
+            </div>
+            <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
+            <p>Thank you for using Highest Data!</p>
+          </div>`
+        );
+      } else {
+        console.log(`A2C transaction not found for ref: ${ref}`);
       }
     }
+
+    // Handle failed status
+    else if (
+      payload.service === "Airtime2Cash" &&
+      payload.status === "Failed"
+    ) {
+      const { ref, message } = payload;
+
+      console.log(`Processing A2C failed webhook: ref=${ref}`);
+
+      const snap = await db
+        .collectionGroup("transactions")
+        .where("reference", "==", ref)
+        .where("type", "==", "airtime_cash")
+        .limit(1)
+        .get();
+
+      if (!snap.empty) {
+        const txnDoc = snap.docs[0];
+
+        await txnDoc.ref.update({
+          status: "failed",
+          failureReason: message || "Airtime transfer not received",
+          failedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        console.log(`A2C Failed: ref ${ref} marked as failed`);
+      }
+    }
+  } catch (err) {
+    console.error("VTU Webhook processing error:", err);
+  }
+});
+
+// === GET AIRTIME TO CASH RATES (for frontend) ===
+app.get("/api/airtime-cash/rates", async (req, res) => {
+  try {
+    const ratesDoc = await db
+      .collection("settings")
+      .doc("airtimeToCashRates")
+      .get();
+
+    if (ratesDoc.exists) {
+      const rates = ratesDoc.data();
+      res.json({
+        success: true,
+        data: rates,
+      });
+    } else {
+      // Return default rates
+      res.json({
+        success: true,
+        data: {
+          mtn: { rate: 0.7, charge: 30, enabled: true },
+          airtel: { rate: 0.65, charge: 35, enabled: true },
+          glo: { rate: 0.55, charge: 45, enabled: true },
+          "9mobile": { rate: 0.55, charge: 45, enabled: true },
+        },
+      });
+    }
   } catch (error) {
-    console.error("VTU Africa webhook processing error:", error);
+    console.error("Error fetching A2C rates:", error);
+    res.status(500).json({ error: "Failed to fetch rates" });
   }
 });
 
