@@ -612,34 +612,39 @@ app.post("/api/exam/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // For exam cards, we might have a profit margin - FIXED: use .exists not .exists()
+    // Get exam rates
     const examRatesDoc = await db.collection("settings").doc("examRates").get();
-    const examRates = examRatesDoc.exists ? examRatesDoc.data() : {}; // ← FIXED
+    const examRates = examRatesDoc.exists ? examRatesDoc.data() : {};
+    const profitPercentage = examRates.profitMargin || 0;
 
-    const profitPercentage = examRates.profitMargin || 0; // Default 0% if not set
-
-    // Build parameters
+    // Build parameters according to VTU Africa docs
     const params = {
-      service,
-      product_code,
-      quantity,
-      ref,
+      service: service.toLowerCase(), // waec, neco, nabteb, jamb
+      product_code: product_code.toString(),
+      quantity: quantity.toString(),
+      ref: ref,
       webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
     };
 
-    // Add optional parameters if provided
+    // Add optional parameters only if provided
     if (profilecode) params.profilecode = profilecode;
     if (sender) params.sender = sender;
     if (phone) params.phone = phone;
 
-    // Make VTU Africa API call
+    console.log("Exam PIN Purchase Params:", params);
+
+    // Use the correct endpoint structure
     const vtuResponse = await makeVtuAfricaRequest("exam-pin", params);
 
+    console.log("VTU Africa Exam PIN Response:", vtuResponse);
+
     if (vtuResponse.code === 101) {
+      // Extract amount from response - FIXED based on docs
       const amountChargedByVTU = parseFloat(
-        vtuResponse.description.Amount_Charged
+        vtuResponse.description.Amount_Charged ||
+          vtuResponse.description.UnitPrice
       );
-      const amountToDeduct = amountChargedByVTU * (1 + profitPercentage / 100); // Amount with profit
+      const amountToDeduct = amountChargedByVTU * (1 + profitPercentage / 100);
 
       console.log(
         `Exam card purchase: VTU Amount: ${amountChargedByVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
@@ -647,12 +652,12 @@ app.post("/api/exam/purchase", async (req, res) => {
         }`
       );
 
-      // Check wallet balance against total amount (VTU cost + profit)
+      // Check wallet balance
       if (amountToDeduct > userData.walletBalance) {
         return res.status(400).json({ error: "Insufficient balance" });
       }
 
-      // Deduct TOTAL AMOUNT (VTU cost + profit) from wallet
+      // Deduct from wallet
       await db
         .collection("users")
         .doc(userId)
@@ -660,7 +665,7 @@ app.post("/api/exam/purchase", async (req, res) => {
           walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction with both amounts
+      // Record transaction
       await db
         .collection("users")
         .doc(userId)
@@ -668,17 +673,18 @@ app.post("/api/exam/purchase", async (req, res) => {
         .add({
           userId,
           type: "exam",
-          service,
+          service: service.toLowerCase(),
           productCode: product_code,
-          quantity,
-          amountToVTU: amountChargedByVTU, // Amount VTU Africa charged
-          amountCharged: amountToDeduct, // Total amount user paid (with profit)
-          profit: amountToDeduct - amountChargedByVTU, // Your profit margin
+          quantity: parseInt(quantity),
+          amountToVTU: amountChargedByVTU,
+          amountCharged: amountToDeduct,
+          profit: amountToDeduct - amountChargedByVTU,
           reference: ref,
           status: "success",
-          description: `${service} Exam PIN Purchase`,
+          description: `${service.toUpperCase()} Exam PIN Purchase`,
           vtuResponse: vtuResponse,
-          pins: vtuResponse.description.pins,
+          pins: vtuResponse.description.pins, // Store the actual PINs
+          productName: vtuResponse.description.ProductName,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -686,15 +692,143 @@ app.post("/api/exam/purchase", async (req, res) => {
         success: true,
         message: "Exam PIN purchase successful",
         data: vtuResponse,
+        pins: vtuResponse.description.pins, // Send PINs to frontend
       });
     } else {
       res.status(400).json({
-        error: vtuResponse.description?.message || "Exam PIN purchase failed",
+        error:
+          vtuResponse.description?.message ||
+          vtuResponse.description ||
+          "Exam PIN purchase failed",
         data: vtuResponse,
       });
     }
   } catch (error) {
     console.error("Exam PIN purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/exam/verify-jamb", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { profilecode, product_code } = req.body;
+
+  if (!profilecode || !product_code) {
+    return res
+      .status(400)
+      .json({ error: "Profile code and product code are required" });
+  }
+
+  try {
+    // Make VTU Africa verification call
+    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
+      serviceName: "jamb",
+      profilecode: profilecode,
+      product_code: product_code.toString(), // 1 for UTME, 2 for Direct Entry
+    });
+
+    console.log("JAMB Verification Response:", vtuResponse);
+
+    if (vtuResponse.code === 101) {
+      res.json({
+        success: true,
+        message: "JAMB candidate verification successful",
+        data: {
+          candidateName: vtuResponse.description.Customer,
+          profileCode: vtuResponse.description.ProfileCode,
+          service: vtuResponse.description.Service,
+          status: vtuResponse.description.Status,
+        },
+      });
+    } else {
+      res.status(400).json({
+        error:
+          vtuResponse.description?.message ||
+          "JAMB candidate verification failed",
+        data: vtuResponse,
+      });
+    }
+  } catch (error) {
+    console.error("JAMB verification error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/exam/services", async (req, res) => {
+  try {
+    const services = {
+      waec: [
+        {
+          code: "1",
+          name: "WAEC Result Checking PIN",
+          description: "For checking WAEC results",
+        },
+        {
+          code: "2",
+          name: "WAEC GCE Registration PIN",
+          description: "For WAEC GCE registration",
+        },
+        {
+          code: "3",
+          name: "WAEC Verification PIN",
+          description: "For WAEC result verification",
+        },
+      ],
+      neco: [
+        {
+          code: "1",
+          name: "NECO Result Checking Token",
+          description: "For checking NECO results",
+        },
+        {
+          code: "2",
+          name: "NECO GCE Registration PIN",
+          description: "For NECO GCE registration",
+        },
+      ],
+      nabteb: [
+        {
+          code: "1",
+          name: "NABTEB Result Checking PIN",
+          description: "For checking NABTEB results",
+        },
+        {
+          code: "2",
+          name: "NABTEB GCE Registration PIN",
+          description: "For NABTEB GCE registration",
+        },
+      ],
+      jamb: [
+        {
+          code: "1",
+          name: "JAMB UTME Registration PIN",
+          description: "For JAMB UTME registration",
+        },
+        {
+          code: "2",
+          name: "JAMB Direct Entry Registration PIN",
+          description: "For JAMB Direct Entry",
+        },
+      ],
+    };
+
+    res.json({
+      success: true,
+      data: services,
+    });
+  } catch (error) {
+    console.error("Get exam services error:", error);
     res.status(500).json({ error: error.message });
   }
 });
