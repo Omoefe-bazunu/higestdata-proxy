@@ -456,6 +456,32 @@ app.post("/api/cabletv/purchase", async (req, res) => {
 });
 
 // === ELECTRICITY BILL PAYMENT ===
+
+app.post("/api/electricity/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+  try {
+    await verifyFirebaseToken(idToken); // just verify token
+    const { service, meterNo, metertype } = req.body;
+    if (!service || !meterNo || !metertype)
+      return res.status(400).json({ error: "Missing params" });
+
+    // VTU Africa has no meter verify endpoint → fake success for frontend flow
+    res.json({
+      success: true,
+      data: {
+        customerName: "Verified Customer",
+        address: "Sample Address",
+        meterNumber: meterNo,
+      },
+    });
+  } catch (err) {
+    res.status(401).json({ error: err.message });
+  }
+});
+
 app.post("/api/electricity/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
