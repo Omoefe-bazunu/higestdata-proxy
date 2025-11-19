@@ -2162,7 +2162,7 @@ app.get("/api/kyc/status", async (req, res) => {
   }
 });
 
-// === HEALTH CHECK ===
+// === HEALTH CHECK. ===
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
