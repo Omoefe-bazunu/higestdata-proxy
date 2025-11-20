@@ -588,6 +588,7 @@ app.post("/api/electricity/purchase", async (req, res) => {
 });
 
 // === EXAM SCRATCH CARDS ===
+// === EXAM SCRATCH CARDS ===
 app.post("/api/exam/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -619,7 +620,7 @@ app.post("/api/exam/purchase", async (req, res) => {
 
     // Build parameters according to VTU Africa docs
     const params = {
-      service: service.toLowerCase(), // waec, neco, nabteb, jamb
+      service: service.toLowerCase(),
       product_code: product_code.toString(),
       quantity: quantity.toString(),
       ref: ref,
@@ -639,30 +640,37 @@ app.post("/api/exam/purchase", async (req, res) => {
     console.log("VTU Africa Exam PIN Response:", vtuResponse);
 
     if (vtuResponse.code === 101) {
-      // Extract amount from response - FIXED based on docs
+      // Extract amount from response
       const amountChargedByVTU = parseFloat(
         vtuResponse.description.Amount_Charged ||
-          vtuResponse.description.UnitPrice
+          vtuResponse.description.UnitPrice ||
+          vtuResponse.description.amount
       );
-      const amountToDeduct = amountChargedByVTU * (1 + profitPercentage / 100);
+
+      // Calculate admin fee and total amount
+      const adminFee = (amountChargedByVTU * profitPercentage) / 100;
+      const totalAmountToDeduct = amountChargedByVTU + adminFee;
 
       console.log(
-        `Exam card purchase: VTU Amount: ${amountChargedByVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
-          amountToDeduct - amountChargedByVTU
-        }`
+        `Exam card purchase: 
+        VTU Amount: ${amountChargedByVTU}, 
+        Admin Fee (${profitPercentage}%): ${adminFee}, 
+        Total Deduction: ${totalAmountToDeduct}`
       );
 
-      // Check wallet balance
-      if (amountToDeduct > userData.walletBalance) {
+      // Check wallet balance against the total amount (main amount + admin fee)
+      if (totalAmountToDeduct > userData.walletBalance) {
         return res.status(400).json({ error: "Insufficient balance" });
       }
 
-      // Deduct from wallet
+      // Deduct total amount (main amount + admin fee) from wallet
       await db
         .collection("users")
         .doc(userId)
         .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
+          walletBalance: admin.firestore.FieldValue.increment(
+            -totalAmountToDeduct
+          ),
         });
 
       // Record transaction
@@ -676,14 +684,15 @@ app.post("/api/exam/purchase", async (req, res) => {
           service: service.toLowerCase(),
           productCode: product_code,
           quantity: parseInt(quantity),
-          amountToVTU: amountChargedByVTU,
-          amountCharged: amountToDeduct,
-          profit: amountToDeduct - amountChargedByVTU,
+          amountToVTU: amountChargedByVTU, // Main amount sent to VTU
+          adminFee: adminFee, // Admin fee/rate
+          totalAmountCharged: totalAmountToDeduct, // Total deducted from wallet
+          profit: adminFee,
           reference: ref,
           status: "success",
           description: `${service.toUpperCase()} Exam PIN Purchase`,
           vtuResponse: vtuResponse,
-          pins: vtuResponse.description.pins, // Store the actual PINs
+          pins: vtuResponse.description.pins,
           productName: vtuResponse.description.ProductName,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
@@ -692,7 +701,12 @@ app.post("/api/exam/purchase", async (req, res) => {
         success: true,
         message: "Exam PIN purchase successful",
         data: vtuResponse,
-        pins: vtuResponse.description.pins, // Send PINs to frontend
+        pins: vtuResponse.description.pins,
+        amountBreakdown: {
+          mainAmount: amountChargedByVTU,
+          adminFee: adminFee,
+          totalAmount: totalAmountToDeduct,
+        },
       });
     } else {
       res.status(400).json({
@@ -705,6 +719,74 @@ app.post("/api/exam/purchase", async (req, res) => {
     }
   } catch (error) {
     console.error("Exam PIN purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add this new endpoint for price estimation
+app.post("/api/exam/estimate-price", async (req, res) => {
+  const { service, product_code, quantity } = req.body;
+
+  if (!service || !product_code || !quantity) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    // Get exam rates
+    const examRatesDoc = await db.collection("settings").doc("examRates").get();
+    const examRates = examRatesDoc.exists ? examRatesDoc.data() : {};
+    const profitPercentage = examRates.profitMargin || 0;
+
+    // Make a dry-run request to VTU Africa to get actual pricing
+    const params = {
+      service: service.toLowerCase(),
+      product_code: product_code.toString(),
+      quantity: quantity.toString(),
+      dry_run: "true", // Add dry-run parameter if supported by VTU Africa
+    };
+
+    let estimatedMainAmount;
+
+    try {
+      // Try to get actual price from VTU Africa
+      const vtuResponse = await makeVtuAfricaRequest("exam-pin", params);
+      if (vtuResponse.code === 101) {
+        estimatedMainAmount = parseFloat(
+          vtuResponse.description.Amount_Charged ||
+            vtuResponse.description.UnitPrice ||
+            vtuResponse.description.amount
+        );
+      } else {
+        // Fallback to default prices if dry-run fails
+        throw new Error("Dry-run failed, using fallback prices");
+      }
+    } catch (error) {
+      // Fallback prices based on service type
+      const fallbackPrices = {
+        waec: { 1: 3500, 2: 3800, 3: 3200 },
+        neco: { 1: 2500, 2: 2800 },
+        nabteb: { 1: 2500, 2: 2800 },
+        jamb: { 1: 5000, 2: 5500 },
+      };
+
+      estimatedMainAmount = fallbackPrices[service]?.[product_code] || 3000;
+      estimatedMainAmount *= parseInt(quantity);
+    }
+
+    const adminFee = (estimatedMainAmount * profitPercentage) / 100;
+    const totalAmount = estimatedMainAmount + adminFee;
+
+    res.json({
+      success: true,
+      data: {
+        mainAmount: estimatedMainAmount,
+        adminFee: adminFee,
+        totalAmount: totalAmount,
+        profitPercentage: profitPercentage,
+      },
+    });
+  } catch (error) {
+    console.error("Price estimation error:", error);
     res.status(500).json({ error: error.message });
   }
 });
