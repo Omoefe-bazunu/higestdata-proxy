@@ -964,6 +964,7 @@ app.post("/api/betting/verify", async (req, res) => {
 });
 
 // === BETTING ACCOUNT FUNDING ===
+// === BETTING ACCOUNT FUNDING - CORRECTED ===
 app.post("/api/betting/fund", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -977,7 +978,7 @@ app.post("/api/betting/fund", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
-  const { service, userid, amount, ref } = req.body;
+  const { service, userid, amount, ref, phone } = req.body;
 
   if (!service || !userid || !amount || !ref) {
     return res.status(400).json({ error: "Missing required parameters" });
@@ -987,17 +988,17 @@ app.post("/api/betting/fund", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get betting rates to calculate service charge - FIXED: use .exists not .exists()
+    // Get betting rates to calculate service charge
     const bettingRatesDoc = await db
       .collection("settings")
       .doc("bettingRates")
       .get();
-    const bettingRates = bettingRatesDoc.exists ? bettingRatesDoc.data() : {}; // ← FIXED
+    const bettingRates = bettingRatesDoc.exists ? bettingRatesDoc.data() : {};
 
     const serviceCharge = parseFloat(bettingRates.serviceCharge) || 0;
     const chargeType = bettingRates.chargeType || "fixed";
 
-    const amountToVTU = parseFloat(amount); // Amount sent to betting account
+    const amountToVTU = parseFloat(amount);
     let amountToDeduct = amountToVTU;
 
     // Calculate service charge
@@ -1013,21 +1014,44 @@ app.post("/api/betting/fund", async (req, res) => {
       }`
     );
 
-    // Check wallet balance against total amount (betting + service charge)
+    // Check wallet balance against total amount
     if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call with betting amount
-    const vtuResponse = await makeVtuAfricaRequest("betpay", {
-      service,
-      userid,
-      amount: amountToVTU,
-      ref,
+    // === CORRECTED: Use direct API call with proper URL structure ===
+    const baseParams = {
+      apikey: VTU_AFRICA_API_KEY,
+      service: service.toLowerCase(),
+      userid: userid.toString(),
+      amount: amountToVTU.toString(),
+      ref: ref,
+      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
+    };
+
+    // Add phone if provided
+    if (phone) {
+      baseParams.phone = phone;
+    }
+
+    const queryString = new URLSearchParams(baseParams).toString();
+    const url = `${VTU_AFRICA_API_URL}/betpay/?${queryString}`;
+
+    console.log(`VTU Africa Betting Request: ${url}`);
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
     });
 
+    const vtuResponse = await response.json();
+    console.log(`VTU Africa Betting Response:`, vtuResponse);
+
+    // Handle response
     if (vtuResponse.code === 101) {
-      // Deduct TOTAL AMOUNT (betting + service charge) from wallet
+      // Deduct TOTAL AMOUNT from wallet
       await db
         .collection("users")
         .doc(userId)
@@ -1035,7 +1059,7 @@ app.post("/api/betting/fund", async (req, res) => {
           walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
         });
 
-      // Record transaction with both amounts
+      // Record transaction
       await db
         .collection("users")
         .doc(userId)
@@ -1045,9 +1069,9 @@ app.post("/api/betting/fund", async (req, res) => {
           type: "betting",
           service,
           userid,
-          amountToVTU: amountToVTU, // Amount sent to betting account
-          amountCharged: amountToDeduct, // Total amount user paid (with service charge)
-          serviceCharge: amountToDeduct - amountToVTU, // Your service charge
+          amountToVTU: amountToVTU,
+          amountCharged: amountToDeduct,
+          serviceCharge: amountToDeduct - amountToVTU,
           reference: ref,
           status: "success",
           description: `${service} Account Funding for ${userid}`,
@@ -1061,6 +1085,39 @@ app.post("/api/betting/fund", async (req, res) => {
         data: vtuResponse,
       });
     } else {
+      // Handle pending status specifically
+      if (
+        vtuResponse.code === 102 ||
+        vtuResponse.description?.Status === "Pending"
+      ) {
+        // Record as pending transaction
+        await db
+          .collection("users")
+          .doc(userId)
+          .collection("transactions")
+          .add({
+            userId,
+            type: "betting",
+            service,
+            userid,
+            amountToVTU: amountToVTU,
+            amountCharged: amountToDeduct,
+            serviceCharge: amountToDeduct - amountToVTU,
+            reference: ref,
+            status: "pending",
+            description: `${service} Account Funding for ${userid}`,
+            vtuResponse: vtuResponse,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+        return res.status(200).json({
+          success: false,
+          message: "Transaction is pending. Please wait for confirmation.",
+          data: vtuResponse,
+          status: "pending",
+        });
+      }
+
       res.status(400).json({
         error: vtuResponse.description?.message || "Betting funding failed",
         data: vtuResponse,
@@ -1071,6 +1128,36 @@ app.post("/api/betting/fund", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// === SPECIALIZED VTU AFRICA BETTING REQUEST ===
+async function makeVtuAfricaBettingRequest(params) {
+  try {
+    const baseParams = {
+      apikey: VTU_AFRICA_API_KEY,
+      ...params,
+    };
+
+    const queryString = new URLSearchParams(baseParams).toString();
+    const url = `${VTU_AFRICA_API_URL}/betpay/?${queryString}`;
+
+    console.log(`VTU Africa Betting Request: ${url}`);
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    const data = await response.json();
+    console.log(`VTU Africa Betting Response:`, data);
+
+    return data;
+  } catch (error) {
+    console.error("VTU Africa Betting API Error:", error);
+    throw new Error(`VTU Africa Betting API request failed: ${error.message}`);
+  }
+}
 
 // === BULK SMS PURCHASE ===
 app.post("/api/sms/purchase", async (req, res) => {
