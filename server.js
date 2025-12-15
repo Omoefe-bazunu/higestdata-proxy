@@ -38,6 +38,15 @@ try {
 const VTU_AFRICA_API_URL = "https://vtuafrica.com.ng/portal/api";
 const VTU_AFRICA_SANDBOX_URL = "https://vtuafrica.com.ng/portal/api-test";
 const VTU_AFRICA_API_KEY = process.env.VTU_AFRICA_API_KEY;
+
+//EBILLS CONFIG (FOR AIRTIME & DATA) ===
+const EBILLS_AUTH_URL = "https://ebills.africa/wp-json/jwt-auth/v1/token";
+const EBILLS_API_URL = "https://ebills.africa/wp-json/api/v2";
+const EBILLS_USERNAME = process.env.EBILLS_USERNAME;
+const EBILLS_PASSWORD = process.env.EBILLS_PASSWORD;
+const EBILLS_PIN = process.env.EBILLS_USER_PIN;
+
+//KORA PAYMENTS CONFIG ===
 const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY;
 const KORA_PUBLIC_KEY = process.env.KORA_PUBLIC_KEY;
 
@@ -142,7 +151,60 @@ async function makeVtuAfricaRequest(endpoint, params) {
   }
 }
 
-// === AIRTIME PURCHASE ===
+// === ADD EBILLS AUTH HELPER ===
+let ebillsToken = null;
+let tokenExpiry = 0;
+
+async function getEbillsToken() {
+  const now = Date.now();
+  if (ebillsToken && now < tokenExpiry - 300000) return ebillsToken;
+
+  console.log("Acquiring new Ebills Token...");
+  try {
+    const response = await fetch(EBILLS_AUTH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: EBILLS_USERNAME,
+        password: EBILLS_PASSWORD,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`Ebills Auth Failed: ${response.status}`);
+
+    const data = await response.json();
+    if (data.token) {
+      ebillsToken = data.token;
+      tokenExpiry = now + 24 * 60 * 60 * 1000;
+      return ebillsToken;
+    }
+    throw new Error("No token in auth response");
+  } catch (error) {
+    console.error("Ebills Token Error:", error);
+    throw error;
+  }
+}
+
+// === ADD EBILLS REQUEST HELPER ===
+async function makeEbillsRequest(endpoint, method = "GET", body = null) {
+  try {
+    const token = await getEbillsToken();
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+    const config = { method, headers };
+    if (body) config.body = JSON.stringify(body);
+
+    const response = await fetch(`${EBILLS_API_URL}${endpoint}`, config);
+    return await response.json();
+  } catch (error) {
+    console.error("Ebills API Error:", error);
+    throw new Error(`Ebills request failed: ${error.message}`);
+  }
+}
+
+// === AIRTIME PURCHASE (EBILLS) ===
 app.post("/api/airtime/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -166,61 +228,57 @@ app.post("/api/airtime/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get airtime rates to calculate discount - FIXED: use .exists not .exists()
+    // Get rates
     const airtimeRatesDoc = await db
       .collection("settings")
       .doc("airtimeRates")
       .get();
     const airtimeRates = airtimeRatesDoc.exists
       ? airtimeRatesDoc.data().rates
-      : {}; // ← FIXED
+      : {};
 
     const discountPercentage = airtimeRates[network]?.discountPercentage || 0;
-    const amountToVTU = parseFloat(amount); // Full amount sent to VTU Africa
-    const amountToDeduct = amountToVTU * (1 - discountPercentage / 100); // Discounted amount from wallet
+    const amountToPurchase = parseFloat(amount);
+    const amountToDeduct = amountToPurchase * (1 - discountPercentage / 100);
 
-    console.log(
-      `Airtime purchase: VTU Amount: ${amountToVTU}, Discount: ${discountPercentage}%, Wallet Deduction: ${amountToDeduct}`
-    );
+    console.log(`Airtime: Buy ${amountToPurchase}, Charge ${amountToDeduct}`);
 
-    // Check wallet balance against discounted amount
     if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call with full amount
-    const vtuResponse = await makeVtuAfricaRequest("airtime", {
-      network: network.toLowerCase(),
-      phone,
-      amount: amountToVTU,
-      ref,
+    // Call Ebills
+    const ebillsResponse = await makeEbillsRequest("/airtime", "POST", {
+      request_id: ref,
+      phone: phone,
+      service_id: network.toLowerCase(), // Ebills uses 'mtn', 'airtel' etc.
+      amount: amountToPurchase,
     });
 
-    console.log("VTU Africa Airtime Response:", vtuResponse);
-
-    if (vtuResponse.code === 101) {
-      // Deduct DISCOUNTED amount from wallet, not full amount
+    // Check for success code 'success' or HTTP 200/201 logic
+    if (ebillsResponse.code === "success") {
       const batch = db.batch();
 
+      // Deduct wallet
       batch.update(db.collection("users").doc(userId), {
         walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
       });
 
-      // Record transaction with both amounts
+      // Record transaction
       batch.set(
-        db.collection("users").doc(userId).collection("transactions").doc(),
+        db.collection("users").doc(userId).collection("transactions").doc(ref), // Use Ref as ID
         {
           userId,
           type: "airtime",
           network,
           phone,
-          amountToVTU: amountToVTU, // Full amount sent to VTU
-          amountCharged: amountToDeduct, // Actual amount deducted from wallet
-          discountPercentage: discountPercentage,
+          amountToProvider: amountToPurchase,
+          amountCharged: amountToDeduct,
+          discountPercentage,
           reference: ref,
-          status: "success",
-          description: `${network} Airtime to ${phone} (${discountPercentage}% discount)`,
-          vtuResponse: vtuResponse,
+          status: "success", // Ebills returns immediate status usually
+          description: `${network} Airtime to ${phone}`,
+          providerResponse: ebillsResponse,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         }
       );
@@ -230,16 +288,12 @@ app.post("/api/airtime/purchase", async (req, res) => {
       res.json({
         success: true,
         message: "Airtime purchase successful",
-        data: {
-          ...vtuResponse,
-          walletDeduction: amountToDeduct,
-          discountApplied: discountPercentage,
-        },
+        data: ebillsResponse,
       });
     } else {
       res.status(400).json({
-        error: vtuResponse.description?.message || "Airtime purchase failed",
-        data: vtuResponse,
+        error: ebillsResponse.message || "Airtime purchase failed",
+        data: ebillsResponse,
       });
     }
   } catch (error) {
@@ -248,7 +302,7 @@ app.post("/api/airtime/purchase", async (req, res) => {
   }
 });
 
-// === DATA PURCHASE ===
+// === DATA PURCHASE (EBILLS) ===
 app.post("/api/data/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -262,6 +316,7 @@ app.post("/api/data/purchase", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
+  // Frontend sends: service, MobileNumber, DataPlan (variation_id)
   const { service, MobileNumber, DataPlan, ref } = req.body;
 
   if (!service || !MobileNumber || !DataPlan || !ref) {
@@ -272,81 +327,90 @@ app.post("/api/data/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get data rates to find the plan price - FIXED: use .exists not .exists()
+    // Get pricing from Firestore (Source of truth for User Price)
     const dataRatesDoc = await db.collection("settings").doc("dataRates").get();
-    const dataRates = dataRatesDoc.exists ? dataRatesDoc.data().rates : {}; // ← FIXED
+    const dataRates = dataRatesDoc.exists ? dataRatesDoc.data().rates : {};
 
+    // Find the plan in Firestore using the variation ID
     const planData = dataRates[service]?.plans?.[DataPlan];
 
     if (!planData) {
       return res.status(400).json({ error: "Invalid data plan selected" });
     }
 
-    const amountToVTU = parseFloat(planData.basePrice); // Base price to VTU Africa
-    const amountToDeduct = parseFloat(planData.finalPrice); // Final price with profit (what user pays)
+    const amountToDeduct = parseFloat(planData.finalPrice);
+    const basePrice = parseFloat(planData.basePrice); // For profit calc
 
-    console.log(
-      `Data purchase: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
-        amountToDeduct - amountToVTU
-      }`
-    );
-
-    // Check wallet balance against final price (with profit)
     if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call with base price
-    const vtuResponse = await makeVtuAfricaRequest("data", {
-      service,
-      MobileNumber,
-      DataPlan,
-      ref,
+    // Call Ebills
+    const ebillsResponse = await makeEbillsRequest("/data", "POST", {
+      request_id: ref,
+      phone: MobileNumber,
+      service_id: service.toLowerCase(),
+      variation_id: DataPlan, // Ebills expects variation_id
     });
 
-    if (vtuResponse.code === 101) {
-      // Deduct FINAL PRICE (with profit) from wallet
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
-        });
+    if (ebillsResponse.code === "success") {
+      const batch = db.batch();
 
-      // Record transaction with both amounts
-      await db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .add({
+      // Deduct wallet
+      batch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
+      });
+
+      // Record transaction
+      batch.set(
+        db.collection("users").doc(userId).collection("transactions").doc(ref),
+        {
           userId,
           type: "data",
           service,
           phone: MobileNumber,
           dataPlan: DataPlan,
-          amountToVTU: amountToVTU, // Base price sent to VTU
-          amountCharged: amountToDeduct, // Final price user paid (with profit)
-          profit: amountToDeduct - amountToVTU, // Your profit margin
+          planName: planData.name || "Data Plan",
+          amountCharged: amountToDeduct,
+          profit: amountToDeduct - basePrice,
           reference: ref,
           status: "success",
           description: `${service} Data to ${MobileNumber}`,
-          vtuResponse: vtuResponse,
+          providerResponse: ebillsResponse,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        }
+      );
+
+      await batch.commit();
 
       res.json({
         success: true,
         message: "Data purchase successful",
-        data: vtuResponse,
+        data: ebillsResponse,
       });
     } else {
       res.status(400).json({
-        error: vtuResponse.description?.message || "Data purchase failed",
-        data: vtuResponse,
+        error: ebillsResponse.message || "Data purchase failed",
+        data: ebillsResponse,
       });
     }
   } catch (error) {
     console.error("Data purchase error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === NEW ENDPOINT: GET EBILLS VARIATIONS (For Admin Dashboard) ===
+app.get("/api/ebills/variations", async (req, res) => {
+  const { service_id } = req.query; // e.g., mtn, airtel
+  try {
+    const endpoint = service_id
+      ? `/variations/data?service_id=${service_id}`
+      : `/variations/data`;
+
+    const data = await makeEbillsRequest(endpoint, "GET");
+    res.json(data);
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
