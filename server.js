@@ -979,46 +979,44 @@ app.get("/api/exam/services", async (req, res) => {
   }
 });
 
-// === BETTING VERIFICATION ===
+// === BETTING VERIFICATION (EBILLS) ===
 app.post("/api/betting/verify", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
 
-  let userId;
   try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
+    await verifyFirebaseToken(idToken); // Verify auth
+    const { service, userid } = req.body; // Frontend sends 'userid'
 
-  const { service, userid } = req.body;
+    if (!service || !userid) {
+      return res.status(400).json({ error: "Service and user ID required" });
+    }
 
-  if (!service || !userid) {
-    return res.status(400).json({ error: "Service and user ID required" });
-  }
-
-  try {
-    // Make VTU Africa verification call
-    const vtuResponse = await makeVtuAfricaRequest("merchant-verify", {
-      serviceName: "Betting",
-      service,
-      userid,
+    // Call Ebills Verify
+    // Ebills expects: { customer_id, service_id }
+    const ebillsResponse = await makeEbillsRequest("/verify-customer", "POST", {
+      service_id: service,
+      customer_id: userid,
     });
 
-    if (vtuResponse.code === 101) {
+    // Check Ebills response structure
+    if (ebillsResponse.code === "success") {
       res.json({
         success: true,
-        message: "Betting account verified",
-        data: vtuResponse,
+        message: "Account verified",
+        data: {
+          description: {
+            Customer: ebillsResponse.data?.customer_name || "Verified Customer",
+          },
+        },
       });
     } else {
       res.status(400).json({
-        error:
-          vtuResponse.description?.message ||
-          "Betting account verification failed",
-        data: vtuResponse,
+        success: false, // Explicitly set false for frontend logic
+        error: ebillsResponse.message || "Verification failed",
+        data: ebillsResponse,
       });
     }
   } catch (error) {
@@ -1027,8 +1025,7 @@ app.post("/api/betting/verify", async (req, res) => {
   }
 });
 
-// === BETTING ACCOUNT FUNDING ===
-// === BETTING ACCOUNT FUNDING - CORRECTED ===
+// === BETTING ACCOUNT FUNDING (EBILLS) ===
 app.post("/api/betting/fund", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -1042,7 +1039,7 @@ app.post("/api/betting/fund", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
-  const { service, userid, amount, ref, phone } = req.body;
+  const { service, userid, amount, ref } = req.body;
 
   if (!service || !userid || !amount || !ref) {
     return res.status(400).json({ error: "Missing required parameters" });
@@ -1052,139 +1049,76 @@ app.post("/api/betting/fund", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get betting rates to calculate service charge
+    // Get Service Charge from Firestore
     const bettingRatesDoc = await db
       .collection("settings")
       .doc("bettingRates")
       .get();
     const bettingRates = bettingRatesDoc.exists ? bettingRatesDoc.data() : {};
 
-    const serviceCharge = parseFloat(bettingRates.serviceCharge) || 0;
+    const serviceChargeVal = parseFloat(bettingRates.serviceCharge) || 0;
     const chargeType = bettingRates.chargeType || "fixed";
+    const amountToFund = parseFloat(amount);
 
-    const amountToVTU = parseFloat(amount);
-    let amountToDeduct = amountToVTU;
-
-    // Calculate service charge
+    // Calculate Deduction
+    let amountToDeduct = amountToFund;
     if (chargeType === "percentage") {
-      amountToDeduct = amountToVTU + (amountToVTU * serviceCharge) / 100;
+      amountToDeduct = amountToFund + (amountToFund * serviceChargeVal) / 100;
     } else {
-      amountToDeduct = amountToVTU + serviceCharge;
+      amountToDeduct = amountToFund + serviceChargeVal;
     }
 
-    console.log(
-      `Betting funding: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Service Charge: ${
-        amountToDeduct - amountToVTU
-      }`
-    );
-
-    // Check wallet balance against total amount
     if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // === CORRECTED: Use direct API call with proper URL structure ===
-    const baseParams = {
-      apikey: VTU_AFRICA_API_KEY,
-      service: service.toLowerCase(),
-      userid: userid.toString(),
-      amount: amountToVTU.toString(),
-      ref: ref,
-      webhookURL: "https://higestdata-proxy.onrender.com/webhook/vtu",
-    };
-
-    // Add phone if provided
-    if (phone) {
-      baseParams.phone = phone;
-    }
-
-    const queryString = new URLSearchParams(baseParams).toString();
-    const url = `${VTU_AFRICA_API_URL}/betpay/?${queryString}`;
-
-    console.log(`VTU Africa Betting Request: ${url}`);
-
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
+    // Call Ebills
+    const ebillsResponse = await makeEbillsRequest("/betting", "POST", {
+      request_id: ref,
+      service_id: service, // e.g., 'bet9ja'
+      customer_id: userid, // The betting account ID
+      amount: amountToFund,
     });
 
-    const vtuResponse = await response.json();
-    console.log(`VTU Africa Betting Response:`, vtuResponse);
+    if (ebillsResponse.code === "success") {
+      const batch = db.batch();
 
-    // Handle response
-    if (vtuResponse.code === 101) {
-      // Deduct TOTAL AMOUNT from wallet
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
-        });
+      // Deduct Wallet (Total = Amount + Service Charge)
+      batch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
+      });
 
-      // Record transaction
-      await db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .add({
+      // Record Transaction
+      batch.set(
+        db.collection("users").doc(userId).collection("transactions").doc(ref),
+        {
           userId,
           type: "betting",
           service,
           userid,
-          amountToVTU: amountToVTU,
+          amountToProvider: amountToFund,
           amountCharged: amountToDeduct,
-          serviceCharge: amountToDeduct - amountToVTU,
+          serviceCharge: amountToDeduct - amountToFund,
           reference: ref,
           status: "success",
-          description: `${service} Account Funding for ${userid}`,
-          vtuResponse: vtuResponse,
+          description: `${service} Funding for ${userid}`,
+          providerResponse: ebillsResponse,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        }
+      );
+
+      await batch.commit();
 
       res.json({
         success: true,
         message: "Betting account funded successfully",
-        data: vtuResponse,
+        data: ebillsResponse,
       });
     } else {
-      // Handle pending status specifically
-      if (
-        vtuResponse.code === 102 ||
-        vtuResponse.description?.Status === "Pending"
-      ) {
-        // Record as pending transaction
-        await db
-          .collection("users")
-          .doc(userId)
-          .collection("transactions")
-          .add({
-            userId,
-            type: "betting",
-            service,
-            userid,
-            amountToVTU: amountToVTU,
-            amountCharged: amountToDeduct,
-            serviceCharge: amountToDeduct - amountToVTU,
-            reference: ref,
-            status: "pending",
-            description: `${service} Account Funding for ${userid}`,
-            vtuResponse: vtuResponse,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-        return res.status(200).json({
-          success: false,
-          message: "Transaction is pending. Please wait for confirmation.",
-          data: vtuResponse,
-          status: "pending",
-        });
-      }
-
+      // Handle Failure
       res.status(400).json({
-        error: vtuResponse.description?.message || "Betting funding failed",
-        data: vtuResponse,
+        error: ebillsResponse.message || "Betting funding failed",
+        data: ebillsResponse,
       });
     }
   } catch (error) {
@@ -1192,36 +1126,6 @@ app.post("/api/betting/fund", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-// === SPECIALIZED VTU AFRICA BETTING REQUEST ===
-async function makeVtuAfricaBettingRequest(params) {
-  try {
-    const baseParams = {
-      apikey: VTU_AFRICA_API_KEY,
-      ...params,
-    };
-
-    const queryString = new URLSearchParams(baseParams).toString();
-    const url = `${VTU_AFRICA_API_URL}/betpay/?${queryString}`;
-
-    console.log(`VTU Africa Betting Request: ${url}`);
-
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    const data = await response.json();
-    console.log(`VTU Africa Betting Response:`, data);
-
-    return data;
-  } catch (error) {
-    console.error("VTU Africa Betting API Error:", error);
-    throw new Error(`VTU Africa Betting API request failed: ${error.message}`);
-  }
-}
 
 // === BULK SMS PURCHASE ===
 app.post("/api/sms/purchase", async (req, res) => {
