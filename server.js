@@ -422,7 +422,55 @@ app.get("/api/ebills/variations", async (req, res) => {
   }
 });
 
-// === CABLE TV SUBSCRIPTION ===
+// === GET EBILLS TV VARIATIONS (For Admin Dashboard) ===
+app.get("/api/ebills/tv-variations", async (req, res) => {
+  const { service_id } = req.query; // e.g., dstv, gotv
+  try {
+    const endpoint = service_id
+      ? `/variations/tv?service_id=${service_id}`
+      : `/variations/tv`;
+
+    const data = await makeEbillsRequest(endpoint, "GET");
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === NEW: VERIFY SMARTCARD (Ebills) ===
+app.post("/api/cabletv/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const { service, smartNo } = req.body;
+    if (!service || !smartNo)
+      return res.status(400).json({ error: "Missing parameters" });
+
+    // Call Ebills Verify
+    // Note: Ebills expects 'customer_id' and 'service_id'
+    const ebillsResponse = await makeEbillsRequest("/verify-customer", "POST", {
+      service_id: service,
+      customer_id: smartNo,
+    });
+
+    if (ebillsResponse.code === "success") {
+      res.json({
+        success: true,
+        customerName: ebillsResponse.data?.customer_name || "Valid Customer",
+        data: ebillsResponse.data,
+      });
+    } else {
+      res.status(400).json({ error: "Invalid Smartcard Number" });
+    }
+  } catch (error) {
+    console.error("Verify TV error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === UPDATED: CABLE TV PURCHASE (Switched to Ebills) ===
 app.post("/api/cabletv/purchase", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -446,9 +494,9 @@ app.post("/api/cabletv/purchase", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Get TV rates to find the plan price - FIXED: use .exists not .exists()
+    // Get TV rates from Firestore
     const tvRatesDoc = await db.collection("settings").doc("tvRates").get();
-    const tvRates = tvRatesDoc.exists ? tvRatesDoc.data().rates : {}; // ← FIXED
+    const tvRates = tvRatesDoc.exists ? tvRatesDoc.data().rates : {};
 
     const planData = tvRates[service]?.plans?.[variation];
 
@@ -456,68 +504,60 @@ app.post("/api/cabletv/purchase", async (req, res) => {
       return res.status(400).json({ error: "Invalid TV plan selected" });
     }
 
-    const amountToVTU = parseFloat(planData.basePrice); // Base price to VTU Africa
-    const amountToDeduct = parseFloat(planData.finalPrice); // Final price with profit (what user pays)
+    const amountToPurchase = parseFloat(planData.basePrice); // Cost from Ebills (stored in DB)
+    const amountToDeduct = parseFloat(planData.finalPrice); // User pays this
 
-    console.log(
-      `Cable TV purchase: VTU Amount: ${amountToVTU}, Wallet Deduction: ${amountToDeduct}, Profit: ${
-        amountToDeduct - amountToVTU
-      }`
-    );
-
-    // Check wallet balance against final price (with profit)
     if (amountToDeduct > userData.walletBalance) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Make VTU Africa API call with base price
-    const vtuResponse = await makeVtuAfricaRequest("paytv", {
-      service,
-      smartNo,
-      variation,
-      ref,
+    // Call Ebills Purchase Endpoint
+    const ebillsResponse = await makeEbillsRequest("/tv", "POST", {
+      request_id: ref,
+      service_id: service, // 'dstv', 'gotv', etc.
+      customer_id: smartNo,
+      variation_id: variation, // The plan ID (e.g., 'dstv-padi')
     });
 
-    if (vtuResponse.code === 101) {
-      // Deduct FINAL PRICE (with profit) from wallet
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
-        });
+    if (ebillsResponse.code === "success") {
+      const batch = db.batch();
 
-      // Record transaction with both amounts
-      await db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .add({
+      // Deduct Wallet
+      batch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(-amountToDeduct),
+      });
+
+      // Record Transaction
+      batch.set(
+        db.collection("users").doc(userId).collection("transactions").doc(ref),
+        {
           userId,
           type: "cabletv",
           service,
           smartCard: smartNo,
           variation,
-          amountToVTU: amountToVTU, // Base price sent to VTU
-          amountCharged: amountToDeduct, // Final price user paid (with profit)
-          profit: amountToDeduct - amountToVTU, // Your profit margin
+          amountToProvider: amountToPurchase,
+          amountCharged: amountToDeduct,
+          profit: amountToDeduct - amountToPurchase,
           reference: ref,
           status: "success",
-          description: `${service} Subscription for ${smartNo}`,
-          vtuResponse: vtuResponse,
+          description: `${service.toUpperCase()} Subscription for ${smartNo}`,
+          providerResponse: ebillsResponse,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        }
+      );
+
+      await batch.commit();
 
       res.json({
         success: true,
         message: "Cable TV subscription successful",
-        data: vtuResponse,
+        data: ebillsResponse,
       });
     } else {
       res.status(400).json({
-        error:
-          vtuResponse.description?.message || "Cable TV subscription failed",
-        data: vtuResponse,
+        error: ebillsResponse.message || "Subscription failed",
+        data: ebillsResponse,
       });
     }
   } catch (error) {
