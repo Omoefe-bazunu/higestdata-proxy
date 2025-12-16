@@ -1585,7 +1585,7 @@ app.get("/api/airtime-cash/rates", async (req, res) => {
 
 // ... BULK EMAIL / NEWSLETTER ENDPOINTS ...
 
-// === NEW: GET CAMPAIGN HISTORY ===
+// === NEW: GET CAMPAIGN HISTORY (FIXED) ===
 app.get("/api/newsletter/history", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -1595,31 +1595,35 @@ app.get("/api/newsletter/history", async (req, res) => {
   try {
     await verifyFirebaseToken(idToken);
 
-    // Initialize MailerLite
+    // Dynamic import for MailerLite
     const MailerLite = (await import("@mailerlite/mailerlite-nodejs")).default;
     const mailerlite = new MailerLite({
       api_key: process.env.MAILERLITE_API_KEY,
     });
 
-    // Fetch campaigns (limit to last 20)
+    // FIX: Use limit 25 (valid) and remove 'sort' (unsupported)
+    // MailerLite returns the newest campaigns first by default.
     const response = await mailerlite.campaigns.get({
-      limit: 20,
-      sort: "-created_at", // Newest first
+      limit: 25,
+      page: 1,
     });
 
-    // Map to a cleaner format
     const history = response.data.data.map((c) => ({
       id: c.id,
       name: c.name,
-      status: c.status, // 'sent', 'draft', 'ready'
-      stats: c.stats, // { sent: 0, opens_count: 0, ... }
+      status: c.status,
+      stats: c.stats,
       created_at: c.created_at,
       scheduled_for: c.scheduled_for,
     }));
 
     res.json({ success: true, history });
   } catch (error) {
-    console.error("Fetch history error:", error);
+    // Improved error logging to see the real issue in Render logs
+    console.error(
+      "Fetch history error:",
+      error.response ? error.response.data : error.message
+    );
     res.status(500).json({ error: "Failed to fetch history" });
   }
 });
