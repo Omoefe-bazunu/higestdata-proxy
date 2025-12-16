@@ -26,6 +26,8 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MAILERLITE_API_KEY = process.env.MAILERLITE_API_KEY;
+const OGAVIRAL_API_URL = "https://ogaviral.com/api/v2";
+const OGAVIRAL_API_KEY = process.env.OGAVIRAL_API_KEY;
 
 // === FIREBASE ADMIN INIT ===
 let db;
@@ -125,6 +127,33 @@ async function verifyFirebaseToken(idToken) {
     return decoded.uid;
   } catch (err) {
     throw new Error("Invalid Firebase token");
+  }
+}
+
+// --- Helper: Make OgaViral Request ---
+async function makeOgaviralRequest(action, params = {}) {
+  try {
+    const payload = {
+      key: OGAVIRAL_API_KEY,
+      action: action,
+      ...params,
+    };
+
+    // OgaViral expects POST form-data or JSON. We'll use JSON.
+    // Note: Some SMM panels strictly require form-urlencoded.
+    // If JSON fails, switch to URLSearchParams.
+    const response = await fetch(OGAVIRAL_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+  } catch (error) {
+    console.error("OgaViral API Error:", error.message);
+    throw new Error(`SMM Provider Error: ${error.message}`);
   }
 }
 
@@ -1787,6 +1816,184 @@ app.post("/api/newsletter/send", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ==========================================
+// === OGAVIRAL (SMM) INTEGRATION START ===
+// ==========================================
+
+// --- Endpoint: Get Services (With Admin Profit Margin) ---
+app.get("/api/smm/services", async (req, res) => {
+  try {
+    // 1. Fetch raw services from OgaViral
+    const providerServices = await makeOgaviralRequest("services");
+
+    // 2. Fetch Admin Settings (Profit Margin)
+    const settingsDoc = await db.collection("settings").doc("smmRates").get();
+    const settings = settingsDoc.exists
+      ? settingsDoc.data()
+      : { profitPercentage: 20 }; // Default 20% profit
+    const profitMultiplier = 1 + settings.profitPercentage / 100;
+
+    // 3. Process services: Filter valid ones & apply markup
+    // OgaViral returns an array of objects. We map to add user_rate.
+    const processedServices = providerServices.map((service) => ({
+      service: service.service,
+      name: service.name,
+      type: service.type,
+      category: service.category,
+      min: service.min,
+      max: service.max,
+      rate: service.rate, // Provider rate (for reference/admin)
+      user_rate: (parseFloat(service.rate) * profitMultiplier).toFixed(2), // Rate shown to user per 1000
+      dripfeed: service.dripfeed,
+      refill: service.refill,
+      cancel: service.cancel,
+    }));
+
+    res.json({
+      success: true,
+      data: processedServices,
+      profitPercentage: settings.profitPercentage,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Endpoint: Place SMM Order ---
+app.post("/api/smm/order", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { serviceId, link, quantity, serviceName, categoryName } = req.body;
+
+  if (!serviceId || !link || !quantity) {
+    return res.status(400).json({ error: "Missing parameters" });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // 1. Get Service Details to Calculate Price
+    // (In production, cache services or fetch specific one to avoid fetching all 2000+ every time)
+    const services = await makeOgaviralRequest("services");
+    const selectedService = services.find((s) => s.service == serviceId);
+
+    if (!selectedService)
+      return res.status(400).json({ error: "Service not found or disabled" });
+
+    // Validate Quantity
+    if (
+      quantity < parseInt(selectedService.min) ||
+      quantity > parseInt(selectedService.max)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error: `Quantity must be between ${selectedService.min} and ${selectedService.max}`,
+        });
+    }
+
+    // 2. Calculate Cost
+    const settingsDoc = await db.collection("settings").doc("smmRates").get();
+    const profitPercentage = settingsDoc.exists
+      ? settingsDoc.data().profitPercentage
+      : 20;
+
+    // Rate is per 1000. Formula: (Rate * Quantity) / 1000
+    const providerCost = (parseFloat(selectedService.rate) * quantity) / 1000;
+    const userCost = providerCost * (1 + profitPercentage / 100);
+
+    if (userCost > userData.walletBalance) {
+      return res.status(400).json({ error: "Insufficient wallet balance" });
+    }
+
+    // 3. Place Order with OgaViral
+    const orderResponse = await makeOgaviralRequest("add", {
+      service: serviceId,
+      link: link,
+      quantity: quantity,
+    });
+
+    if (!orderResponse.order) {
+      throw new Error("Provider did not return an order ID");
+    }
+
+    const orderId = orderResponse.order;
+
+    // 4. Deduct Balance & Save Transaction
+    const batch = db.batch();
+
+    // Deduct
+    batch.update(db.collection("users").doc(userId), {
+      walletBalance: admin.firestore.FieldValue.increment(-userCost),
+    });
+
+    // Record Transaction
+    const ref = `SMM_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    batch.set(
+      db.collection("users").doc(userId).collection("transactions").doc(ref),
+      {
+        userId,
+        type: "smm",
+        serviceId,
+        serviceName: serviceName || selectedService.name,
+        category: categoryName || selectedService.category,
+        link,
+        quantity,
+        providerOrderId: orderId,
+        amountCharged: userCost,
+        amountToProvider: providerCost,
+        profit: userCost - providerCost,
+        reference: ref,
+        status: "success", // SMM orders are usually "pending" delivery but "success" submission
+        deliveryStatus: "Pending", // You can track actual delivery status separately
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }
+    );
+
+    await batch.commit();
+
+    res.json({
+      success: true,
+      message: "Social Boost Order Placed Successfully!",
+      data: { orderId, cost: userCost },
+    });
+  } catch (error) {
+    console.error("SMM Order Failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Endpoint: Admin Set Rates ---
+app.post("/api/admin/smm-rates", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+
+  // Add Admin Check logic here if needed (e.g. check if userData.role === 'admin')
+
+  const { profitPercentage } = req.body;
+  await db
+    .collection("settings")
+    .doc("smmRates")
+    .set({ profitPercentage }, { merge: true });
+  res.json({ success: true, message: "SMM Rates updated" });
+});
+
+// ==========================================
+// === OGAVIRAL INTEGRATION END ===
+// ==========================================
 
 // ==================== KORA PAYMENT ENDPOINTS ====================
 // === KORA: Initialize Payment (Bank Transfer Only) ===
