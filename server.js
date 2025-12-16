@@ -1897,11 +1897,9 @@ app.post("/api/smm/order", async (req, res) => {
       quantity < parseInt(selectedService.min) ||
       quantity > parseInt(selectedService.max)
     ) {
-      return res
-        .status(400)
-        .json({
-          error: `Quantity must be between ${selectedService.min} and ${selectedService.max}`,
-        });
+      return res.status(400).json({
+        error: `Quantity must be between ${selectedService.min} and ${selectedService.max}`,
+      });
     }
 
     // 2. Calculate Cost
@@ -1989,6 +1987,102 @@ app.post("/api/admin/smm-rates", async (req, res) => {
     .doc("smmRates")
     .set({ profitPercentage }, { merge: true });
   res.json({ success: true, message: "SMM Rates updated" });
+});
+
+// --- Endpoint: Get User's SMM Orders & Sync Status ---
+app.get("/api/smm/orders", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  try {
+    // 1. Fetch last 50 SMM transactions from Firestore
+    const snapshot = await db
+      .collection("users")
+      .doc(userId)
+      .collection("transactions")
+      .where("type", "==", "smm")
+      .orderBy("createdAt", "desc")
+      .limit(50)
+      .get();
+
+    if (snapshot.empty) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const orders = [];
+    const orderIdsToCheck = [];
+
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      orders.push({ id: doc.id, ...data });
+      // Only check status for orders that haven't reached a final state
+      // Common final states: Completed, Canceled, Refunded, Partial
+      if (
+        data.providerOrderId &&
+        !["Completed", "Canceled", "Refunded"].includes(data.deliveryStatus)
+      ) {
+        orderIdsToCheck.push(data.providerOrderId);
+      }
+    });
+
+    // 2. Batch Check Status with OgaViral (if needed)
+    if (orderIdsToCheck.length > 0) {
+      try {
+        // OgaViral supports up to 100 IDs comma-separated
+        const statusResponse = await makeOgaviralRequest("status", {
+          orders: orderIdsToCheck.join(","),
+        });
+
+        const batch = db.batch();
+        let updatesMade = false;
+
+        orders.forEach((order) => {
+          if (order.providerOrderId && statusResponse[order.providerOrderId]) {
+            const newStatus = statusResponse[order.providerOrderId].status;
+            const remains = statusResponse[order.providerOrderId].remains;
+
+            // If status changed, update local DB
+            if (newStatus && newStatus !== order.deliveryStatus) {
+              const docRef = db
+                .collection("users")
+                .doc(userId)
+                .collection("transactions")
+                .doc(order.id);
+              batch.update(docRef, {
+                deliveryStatus: newStatus,
+                remains: remains || 0,
+                lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+
+              // Update the order object in memory to return fresh data immediately
+              order.deliveryStatus = newStatus;
+              order.remains = remains;
+              updatesMade = true;
+            }
+          }
+        });
+
+        if (updatesMade) await batch.commit();
+      } catch (err) {
+        console.error("Failed to sync status with provider:", err.message);
+        // Continue to return the cached data even if sync fails
+      }
+    }
+
+    res.json({ success: true, data: orders });
+  } catch (error) {
+    console.error("Get SMM Orders Error:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ==========================================
