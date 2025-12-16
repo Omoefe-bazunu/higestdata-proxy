@@ -4,6 +4,12 @@ const cors = require("cors");
 const crypto = require("crypto");
 require("dotenv").config();
 const admin = require("firebase-admin");
+// NOTE: If you get an error saying "require() of ES Module", change this to a dynamic import inside the route (shown in comments below)
+const MailerLite = require("@mailerlite/mailerlite-nodejs").default;
+
+// // Inside the route handler...
+// const MailerLite = (await import('@mailerlite/mailerlite-nodejs')).default;
+// const mailerlite = new MailerLite({ ... });
 
 // Add these Firestore imports
 const {
@@ -19,6 +25,7 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MAILERLITE_API_KEY = process.env.MAILERLITE_API_KEY;
 
 // === FIREBASE ADMIN INIT ===
 let db;
@@ -1573,6 +1580,143 @@ app.get("/api/airtime-cash/rates", async (req, res) => {
   } catch (error) {
     console.error("Error fetching A2C rates:", error);
     res.status(500).json({ error: "Failed to fetch rates" });
+  }
+});
+
+// === NEW ENDPOINT: SEND NEWSLETTER ===
+app.post("/api/newsletter/send", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    // 1. Verify Admin (Optional: Add a check if the user is actually an admin)
+    const userId = await verifyFirebaseToken(idToken);
+
+    const { subject, content } = req.body;
+    if (!subject || !content) {
+      return res
+        .status(400)
+        .json({ error: "Subject and content are required" });
+    }
+
+    // Initialize MailerLite
+    const mailerlite = new MailerLite({
+      api_key: MAILERLITE_API_KEY,
+    });
+
+    console.log("Starting Newsletter Process...");
+
+    // 2. FETCH ALL USERS FROM FIREBASE
+    const usersSnapshot = await db.collection("users").get();
+    if (usersSnapshot.empty) {
+      return res.status(400).json({ error: "No users found in database" });
+    }
+
+    const users = [];
+    usersSnapshot.forEach((doc) => {
+      const data = doc.data();
+      if (data.email) {
+        users.push({
+          email: data.email,
+          name: data.fullName || data.displayName || "Valued Customer",
+        });
+      }
+    });
+
+    console.log(`Found ${users.length} users to email.`);
+
+    // 3. GET OR CREATE 'WEBSITE_USERS' GROUP
+    // We put all firebase users in a specific group to target them
+    let groupId;
+    const groupsResponse = await mailerlite.groups.get({
+      filter: { name: "Website Users" },
+    });
+
+    if (groupsResponse.data.data && groupsResponse.data.data.length > 0) {
+      groupId = groupsResponse.data.data[0].id;
+    } else {
+      const newGroup = await mailerlite.groups.create({
+        name: "Website Users",
+      });
+      groupId = newGroup.data.data.id;
+    }
+
+    // 4. BATCH SYNC SUBSCRIBERS (Chunking by 50)
+    // MailerLite API allows max 50 ops per batch request
+    const BATCH_SIZE = 50;
+    const chunks = [];
+    for (let i = 0; i < users.length; i += BATCH_SIZE) {
+      chunks.push(users.slice(i, i + BATCH_SIZE));
+    }
+
+    console.log(`Syncing users in ${chunks.length} batches...`);
+
+    for (const chunk of chunks) {
+      const batchRequests = chunk.map((user) => ({
+        method: "POST",
+        path: "/api/subscribers",
+        body: {
+          email: user.email,
+          fields: { name: user.name },
+          groups: [groupId], // Add to our target group
+          status: "active",
+        },
+      }));
+
+      await mailerlite.batches.send({ requests: batchRequests });
+    }
+
+    // 5. CREATE AND SEND CAMPAIGN
+    const campaignParams = {
+      name: `Newsletter: ${subject} - ${
+        new Date().toISOString().split("T")[0]
+      }`,
+      type: "regular",
+      emails: [
+        {
+          subject: subject,
+          from_name: "Highest Data", // Your Sender Name
+          from: "info@highestdata.com.ng", // MUST BE VERIFIED SENDER in MailerLite
+          content: `
+          <!DOCTYPE html>
+          <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+              <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #4f46e5;">${subject}</h2>
+                <div>${content}</div>
+                <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
+                <p style="font-size: 12px; color: #888;">
+                  <a href="{$unsubscribe}">Unsubscribe</a>
+                </p>
+              </div>
+            </body>
+          </html>
+        `,
+        },
+      ],
+      groups: [groupId], // Target the group we just synced
+    };
+
+    const campaignResponse = await mailerlite.campaigns.create(campaignParams);
+    const campaignId = campaignResponse.data.data.id;
+
+    // 6. SCHEDULE FOR IMMEDIATE DELIVERY
+    await mailerlite.campaigns.schedule(campaignId, { delivery: "instant" });
+
+    console.log(`Campaign ${campaignId} sent successfully.`);
+
+    res.json({
+      success: true,
+      message: `Newsletter sent to ${users.length} users`,
+      campaignId,
+    });
+  } catch (error) {
+    console.error("Newsletter Error:", error?.response?.data || error.message);
+    res
+      .status(500)
+      .json({ error: "Failed to send newsletter. Check server logs." });
   }
 });
 
