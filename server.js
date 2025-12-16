@@ -1585,6 +1585,45 @@ app.get("/api/airtime-cash/rates", async (req, res) => {
 
 // ... BULK EMAIL / NEWSLETTER ENDPOINTS ...
 
+// === NEW: GET CAMPAIGN HISTORY ===
+app.get("/api/newsletter/history", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    await verifyFirebaseToken(idToken);
+
+    // Initialize MailerLite
+    const MailerLite = (await import("@mailerlite/mailerlite-nodejs")).default;
+    const mailerlite = new MailerLite({
+      api_key: process.env.MAILERLITE_API_KEY,
+    });
+
+    // Fetch campaigns (limit to last 20)
+    const response = await mailerlite.campaigns.get({
+      limit: 20,
+      sort: "-created_at", // Newest first
+    });
+
+    // Map to a cleaner format
+    const history = response.data.data.map((c) => ({
+      id: c.id,
+      name: c.name,
+      status: c.status, // 'sent', 'draft', 'ready'
+      stats: c.stats, // { sent: 0, opens_count: 0, ... }
+      created_at: c.created_at,
+      scheduled_for: c.scheduled_for,
+    }));
+
+    res.json({ success: true, history });
+  } catch (error) {
+    console.error("Fetch history error:", error);
+    res.status(500).json({ error: "Failed to fetch history" });
+  }
+});
+
 // === NEW: GET USERS FOR REVIEW ===
 app.get("/api/admin/users", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1615,7 +1654,7 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
-// === UPDATED: SEND NEWSLETTER (Accepts 'recipients' list) ===
+// === UPDATED: SEND NEWSLETTER (With Safety Delay) ===
 app.post("/api/newsletter/send", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -1624,23 +1663,16 @@ app.post("/api/newsletter/send", async (req, res) => {
 
   try {
     await verifyFirebaseToken(idToken);
-
-    // NOW RECEIVING 'recipients' FROM FRONTEND
     const { subject, content, recipients } = req.body;
 
     if (!subject || !content || !recipients || recipients.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "Subject, content, and recipient list are required" });
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // Dynamic Import for MailerLite (if needed for CommonJS)
     const MailerLite = (await import("@mailerlite/mailerlite-nodejs")).default;
     const mailerlite = new MailerLite({
       api_key: process.env.MAILERLITE_API_KEY,
     });
-
-    console.log(`Processing newsletter for ${recipients.length} recipients...`);
 
     // 1. PREPARE GROUP
     let groupId;
@@ -1656,13 +1688,14 @@ app.post("/api/newsletter/send", async (req, res) => {
       groupId = newGroup.data.data.id;
     }
 
-    // 2. BATCH SYNC (Use the 'recipients' array passed from frontend)
+    // 2. BATCH SYNC
     const BATCH_SIZE = 50;
     const chunks = [];
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
       chunks.push(recipients.slice(i, i + BATCH_SIZE));
     }
 
+    console.log(`Syncing ${recipients.length} users to MailerLite...`);
     for (const chunk of chunks) {
       const batchRequests = chunk.map((user) => ({
         method: "POST",
@@ -1677,16 +1710,22 @@ app.post("/api/newsletter/send", async (req, res) => {
       await mailerlite.batches.send({ requests: batchRequests });
     }
 
-    // 3. CREATE & SEND CAMPAIGN
+    // === CRITICAL FIX: SAFETY DELAY ===
+    // Wait 3 seconds to let MailerLite process the batch import
+    // before we try to send to this group.
+    console.log("Waiting for MailerLite indexing...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    // 3. CREATE CAMPAIGN
     const campaignParams = {
-      name: `Newsletter: ${subject} - ${new Date().toISOString()}`,
+      name: subject, // Simplified name for cleaner history
       type: "regular",
       emails: [
         {
           subject: subject,
           from_name: "Highest Data",
-          from: "info@highestdata.com.ng", // Ensure this is verified!
-          content: `<!DOCTYPE html><html><body>${content}<br/><a href="{$unsubscribe}">Unsubscribe</a></body></html>`,
+          from: "info@highestdata.com.ng",
+          content: `<!DOCTYPE html><html><body>${content}<br/><br/><small><a href="{$unsubscribe}">Unsubscribe</a></small></body></html>`,
         },
       ],
       groups: [groupId],
@@ -1694,12 +1733,14 @@ app.post("/api/newsletter/send", async (req, res) => {
 
     const campaignResponse = await mailerlite.campaigns.create(campaignParams);
     const campaignId = campaignResponse.data.data.id;
+
+    // 4. SCHEDULE
     await mailerlite.campaigns.schedule(campaignId, { delivery: "instant" });
 
-    res.json({ success: true, message: "Campaign sent successfully!" });
+    res.json({ success: true, message: "Campaign queued successfully!" });
   } catch (error) {
     console.error("Newsletter Error:", error?.response?.data || error.message);
-    res.status(500).json({ error: "Failed to send newsletter." });
+    res.status(500).json({ error: error.message });
   }
 });
 
