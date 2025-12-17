@@ -28,27 +28,62 @@ const PORT = process.env.PORT || 3000;
 const MAILERLITE_API_KEY = process.env.MAILERLITE_API_KEY;
 const OGAVIRAL_API_URL = "https://ogaviral.com/api/v2";
 const OGAVIRAL_API_KEY = process.env.OGAVIRAL_API_KEY;
+const jwt = require("jsonwebtoken"); // Add this to your top-level imports
 
-// === SAFE HAVEN CONFIG ===
+// === SAFE HAVEN CONFIG (PRODUCTION) ===
 const SH_AUTH_URL = "https://api.safehavenmfb.com/oauth2/token";
 const SH_API_URL = "https://api.safehavenmfb.com";
-const SH_CLIENT_ID = process.env.SAFE_HAVEN_CLIENT_ID; // From dashboard
-const SH_ASSERTION = process.env.SAFE_HAVEN_ASSERTION; // The JWT assertion string
-// Note: In production, you should generate the assertion dynamically using your Private Key.
-// For now, we use the static assertion you mentioned you have.
+const SH_AUDIENCE = "https://api.safehavenmfb.com"; // "aud" per docs
+const SH_ISSUER = "https://www.highestdata.com.ng"; // "iss" (Your Company URL)
+
+const SH_CLIENT_ID = process.env.SAFE_HAVEN_CLIENT_ID;
+
+// Handle Private Key Newlines (Fix for Render Environment Variables)
+const SH_PRIVATE_KEY = process.env.SAFE_HAVEN_PRIVATE_KEY
+  ? process.env.SAFE_HAVEN_PRIVATE_KEY.replace(/\\n/g, "\n")
+  : null;
 
 let shAccessToken = null;
 let shTokenExpiry = 0;
 
+// === GENERATE DYNAMIC ASSERTION ===
+function generateClientAssertion() {
+  if (!SH_PRIVATE_KEY)
+    throw new Error("SAFE_HAVEN_PRIVATE_KEY is missing in env");
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // Payload strictly following Safe Haven Docs
+  const payload = {
+    iss: SH_ISSUER, // Your Company URL
+    sub: SH_CLIENT_ID, // OAuth Client ID
+    aud: SH_AUDIENCE, // Safe Haven Environment URL
+    iat: now, // Issued At (Current Time)
+    exp: now + 3600, // Expiry (Current Time + 1 Hour)
+  };
+
+  // Sign with RS256 and include "typ": "JWT" in header
+  return jwt.sign(payload, SH_PRIVATE_KEY, {
+    algorithm: "RS256",
+    header: { typ: "JWT" },
+  });
+}
+
 // === SAFE HAVEN TOKEN MANAGER ===
 async function getSafeHavenToken() {
   const now = Date.now();
+  // Reuse token if it exists and has more than 1 minute left
   if (shAccessToken && now < shTokenExpiry - 60000) {
     return shAccessToken;
   }
 
-  console.log("Refreshing Safe Haven Token...");
+  console.log("Generating new Safe Haven Assertion...");
+
   try {
+    // 1. Generate fresh assertion automatically
+    const assertion = generateClientAssertion();
+
+    [cite_start]; // 2. Exchange for Access Token [cite: 1, 3]
     const response = await fetch(SH_AUTH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -57,23 +92,38 @@ async function getSafeHavenToken() {
         client_assertion_type:
           "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
         client_id: SH_CLIENT_ID,
-        client_assertion: SH_ASSERTION,
+        client_assertion: assertion,
       }),
     });
 
     const data = await response.json();
-    if (!data.access_token)
-      throw new Error("Failed to get SH Token: " + JSON.stringify(data));
+
+    if (!response.ok || !data.access_token) {
+      console.error("SH Auth Failed:", JSON.stringify(data, null, 2));
+      // Reset token if auth failed so we retry next time
+      shAccessToken = null;
+      throw new Error(
+        `Failed to authenticate with Safe Haven: ${
+          data.error_description || data.error
+        }`
+      );
+    }
 
     shAccessToken = data.access_token;
+    [cite_start]; // Store expiry (expires_in is in seconds, usually ~2399s) [cite: 4]
     shTokenExpiry = now + data.expires_in * 1000;
+
+    console.log(
+      "Safe Haven Token Refreshed. Expires in:",
+      data.expires_in,
+      "seconds"
+    );
     return shAccessToken;
   } catch (error) {
-    console.error("Safe Haven Auth Error:", error);
+    console.error("Safe Haven Auth Error:", error.message);
     throw error;
   }
 }
-
 // === FIREBASE ADMIN INIT ===
 let db;
 try {
@@ -169,23 +219,6 @@ async function verifyFirebaseToken(idToken) {
   } catch (err) {
     throw new Error("Invalid Firebase token");
   }
-}
-
-// === HELPER: SAFE HAVEN REQUEST ===
-async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
-  const token = await getSafeHavenToken();
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-    ClientID: SH_CLIENT_ID,
-  };
-
-  const config = { method, headers };
-  if (body) config.body = JSON.stringify(body);
-
-  const res = await fetch(`${SH_API_URL}${endpoint}`, config);
-  const data = await res.json();
-  return { status: res.status, data };
 }
 
 // --- Helper: Make OgaViral Request ---
