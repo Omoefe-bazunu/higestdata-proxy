@@ -29,6 +29,51 @@ const MAILERLITE_API_KEY = process.env.MAILERLITE_API_KEY;
 const OGAVIRAL_API_URL = "https://ogaviral.com/api/v2";
 const OGAVIRAL_API_KEY = process.env.OGAVIRAL_API_KEY;
 
+// === SAFE HAVEN CONFIG ===
+const SH_AUTH_URL = "https://api.sandbox.safehavenmfb.com/oauth2/token";
+const SH_API_URL = "https://api.sandbox.safehavenmfb.com";
+const SH_CLIENT_ID = process.env.SAFE_HAVEN_CLIENT_ID; // From dashboard
+const SH_ASSERTION = process.env.SAFE_HAVEN_ASSERTION; // The JWT assertion string
+// Note: In production, you should generate the assertion dynamically using your Private Key.
+// For now, we use the static assertion you mentioned you have.
+
+let shAccessToken = null;
+let shTokenExpiry = 0;
+
+// === SAFE HAVEN TOKEN MANAGER ===
+async function getSafeHavenToken() {
+  const now = Date.now();
+  if (shAccessToken && now < shTokenExpiry - 60000) {
+    return shAccessToken;
+  }
+
+  console.log("Refreshing Safe Haven Token...");
+  try {
+    const response = await fetch(SH_AUTH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        client_assertion_type:
+          "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        client_id: SH_CLIENT_ID,
+        client_assertion: SH_ASSERTION,
+      }),
+    });
+
+    const data = await response.json();
+    if (!data.access_token)
+      throw new Error("Failed to get SH Token: " + JSON.stringify(data));
+
+    shAccessToken = data.access_token;
+    shTokenExpiry = now + data.expires_in * 1000;
+    return shAccessToken;
+  } catch (error) {
+    console.error("Safe Haven Auth Error:", error);
+    throw error;
+  }
+}
+
 // === FIREBASE ADMIN INIT ===
 let db;
 try {
@@ -54,10 +99,6 @@ const EBILLS_API_URL = "https://ebills.africa/wp-json/api/v2";
 const EBILLS_USERNAME = process.env.EBILLS_USERNAME;
 const EBILLS_PASSWORD = process.env.EBILLS_PASSWORD;
 const EBILLS_PIN = process.env.EBILLS_USER_PIN;
-
-//KORA PAYMENTS CONFIG ===
-const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY;
-const KORA_PUBLIC_KEY = process.env.KORA_PUBLIC_KEY;
 
 // === RESEND EMAIL FUNCTION ===
 async function sendEmail(to, subject, html) {
@@ -128,6 +169,23 @@ async function verifyFirebaseToken(idToken) {
   } catch (err) {
     throw new Error("Invalid Firebase token");
   }
+}
+
+// === HELPER: SAFE HAVEN REQUEST ===
+async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
+  const token = await getSafeHavenToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    ClientID: SH_CLIENT_ID,
+  };
+
+  const config = { method, headers };
+  if (body) config.body = JSON.stringify(body);
+
+  const res = await fetch(`${SH_API_URL}${endpoint}`, config);
+  const data = await res.json();
+  return { status: res.status, data };
 }
 
 // --- Helper: Make OgaViral Request ---
@@ -2089,448 +2147,6 @@ app.get("/api/smm/orders", async (req, res) => {
 // === OGAVIRAL INTEGRATION END ===
 // ==========================================
 
-// ==================== KORA PAYMENT ENDPOINTS ====================
-// === KORA: Initialize Payment (Bank Transfer Only) ===
-app.post("/api/kora/initialize", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const { amount } = req.body;
-  if (!amount || amount < 100)
-    return res.status(400).json({ error: "Minimum ₦100" });
-
-  try {
-    const userSnap = await db.collection("users").doc(userId).get();
-    const userData = userSnap.data();
-    if (!userData) return res.status(404).json({ error: "User not found" });
-
-    const reference = `KRA_${userId}_${Date.now()}`;
-
-    await db
-      .collection("koraTransactions")
-      .doc(reference)
-      .set({
-        userId,
-        reference,
-        amount: Number(amount),
-        status: "pending",
-        email: userData.email,
-        name: userData.fullName || userData.email.split("@")[0],
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    res.json({
-      publicKey: KORA_PUBLIC_KEY,
-      reference,
-      amount: Number(amount),
-      currency: "NGN",
-      customer: {
-        name: userData.fullName || "Customer",
-        email: userData.email,
-      },
-      channels: ["bank_transfer"], // ← Only bank transfer
-      default_channel: "bank_transfer", // ← Default = bank transfer
-    });
-  } catch (error) {
-    console.error("Kora init error:", error);
-    res.status(500).json({ error: "Failed to initialize payment" });
-  }
-});
-
-// === KORA: Verify & Credit Wallet + EMAIL ===
-app.post("/api/kora/verify-and-credit", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  const { reference } = req.body;
-  if (!reference) return res.status(400).json({ error: "Reference required" });
-
-  try {
-    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
-    if (!txnDoc.exists)
-      return res.status(404).json({ error: "Transaction not found" });
-    if (txnDoc.data().status === "success")
-      return res.json({ success: true, message: "Already credited" });
-
-    const koraRes = await fetch(
-      `https://api.korapay.com/merchant/api/v1/charges/${reference}`,
-      {
-        headers: { Authorization: `Bearer ${KORA_SECRET_KEY}` },
-      }
-    );
-    const koraData = await koraRes.json();
-
-    if (!koraData.status || koraData.data?.status !== "success") {
-      return res.status(400).json({ error: "Payment failed" });
-    }
-
-    const amount = parseFloat(koraData.data.amount);
-    const userSnap = await db.collection("users").doc(userId).get();
-    const userData = userSnap.data();
-
-    const batch = db.batch();
-
-    batch.update(db.collection("users").doc(userId), {
-      walletBalance: admin.firestore.FieldValue.increment(amount),
-    });
-
-    batch.update(txnDoc.ref, {
-      status: "success",
-      processedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    batch.set(
-      db.collection("users").doc(userId).collection("transactions").doc(),
-      {
-        userId,
-        reference,
-        description: "Wallet funding via KoraPay",
-        amount,
-        type: "credit",
-        status: "success",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      }
-    );
-
-    await batch.commit();
-
-    // SEND SUCCESS EMAIL
-    await sendEmail(
-      userData.email,
-      "Wallet Funded Successfully!",
-      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
-        <h2 style="color: #10b981;">Payment Successful</h2>
-        <p>Hello <strong>${userData.fullName || userData.email}</strong>,</p>
-        <p>Your wallet has been credited with <strong>₦${amount.toLocaleString()}</strong>.</p>
-        <p><strong>Reference:</strong> ${reference}</p>
-        <p>Thank you for choosing Highest Data!</p>
-      </div>`
-    );
-
-    res.json({ success: true, amount, message: "Wallet credited!" });
-  } catch (error) {
-    console.error("Verify error:", error);
-    res.status(500).json({ error: "Verification failed" });
-  }
-});
-
-// === COMPLETE KORA WEBHOOK - PAYIN & PAYOUT ===
-app.post(
-  "/webhook/kora",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    try {
-      const signature = req.headers["x-korapay-signature"];
-      if (!signature) {
-        console.log("No signature in webhook");
-        return res.status(400).send("No signature");
-      }
-
-      // Verify webhook signature
-      const hash = crypto
-        .createHmac("sha256", KORA_SECRET_KEY)
-        .update(JSON.stringify(req.body.data))
-        .digest("hex");
-
-      if (hash !== signature) {
-        console.log("Invalid webhook signature");
-        return res.status(403).send("Invalid signature");
-      }
-
-      const { event, data } = req.body;
-      console.log(`Webhook received: ${event}`, data);
-
-      // Immediately respond to prevent retries
-      res.status(200).send("Webhook received");
-
-      // Process based on event type
-      if (event === "charge.success") {
-        await handlePayinSuccess(data);
-      } else if (event === "charge.failed") {
-        await handlePayinFailed(data);
-      } else if (event === "transfer.success") {
-        await handlePayoutSuccess(data);
-      } else if (event === "transfer.failed") {
-        await handlePayoutFailed(data);
-      } else {
-        console.log(`Unhandled event type: ${event}`);
-      }
-    } catch (error) {
-      console.error("Webhook processing error:", error);
-      res.status(500).send("Webhook processing error");
-    }
-  }
-);
-
-// === PAYIN SUCCESS HANDLER ===
-async function handlePayinSuccess(data) {
-  const { reference, amount, fee, currency } = data;
-
-  try {
-    // Find transaction in koraTransactions collection
-    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
-
-    if (!txnDoc.exists) {
-      console.log(`Payin transaction not found: ${reference}`);
-      return;
-    }
-
-    const txnData = txnDoc.data();
-
-    // Skip if already processed
-    if (txnData.status === "success") {
-      console.log(`Payin already processed: ${reference}`);
-      return;
-    }
-
-    const userId = txnData.userId;
-    const userSnap = await db.collection("users").doc(userId).get();
-    const userData = userSnap.data();
-
-    const batch = db.batch();
-
-    // Credit user wallet
-    batch.update(db.collection("users").doc(userId), {
-      walletBalance: admin.firestore.FieldValue.increment(amount),
-    });
-
-    // Update transaction status
-    batch.update(txnDoc.ref, {
-      status: "success",
-      processedAt: admin.firestore.FieldValue.serverTimestamp(),
-      webhookProcessed: true,
-    });
-
-    // Add to user transactions
-    batch.set(
-      db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .doc(reference),
-      {
-        userId,
-        reference,
-        description: "Wallet funding via KoraPay",
-        amount,
-        fee,
-        currency,
-        type: "credit",
-        status: "success",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        webhookProcessed: true,
-      }
-    );
-
-    await batch.commit();
-
-    // Send success email
-    await sendEmail(
-      userData.email,
-      "Wallet Funded Successfully!",
-      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
-        <h2 style="color: #10b981;">Payment Successful</h2>
-        <p>Hello <strong>${userData.fullName || userData.email}</strong>,</p>
-        <p>Your wallet has been credited with <strong>₦${amount.toLocaleString()}</strong>.</p>
-        <p><strong>Reference:</strong> ${reference}</p>
-        <p><strong>Fee:</strong> ₦${fee?.toLocaleString() || "0"}</p>
-        <p>Thank you for choosing Highest Data!</p>
-      </div>`
-    );
-
-    console.log(`Payin processed successfully: ${reference}`);
-  } catch (error) {
-    console.error(`Error processing payin success: ${reference}`, error);
-  }
-}
-
-// === PAYIN FAILED HANDLER ===
-async function handlePayinFailed(data) {
-  const { reference } = data;
-
-  try {
-    const txnDoc = await db.collection("koraTransactions").doc(reference).get();
-
-    if (!txnDoc.exists) {
-      console.log(`Failed payin transaction not found: ${reference}`);
-      return;
-    }
-
-    const txnData = txnDoc.data();
-
-    // Update transaction status to failed
-    await txnDoc.ref.update({
-      status: "failed",
-      failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      webhookProcessed: true,
-    });
-
-    console.log(`Payin marked as failed: ${reference}`);
-  } catch (error) {
-    console.error(`Error processing payin failed: ${reference}`, error);
-  }
-}
-
-// === PAYOUT SUCCESS HANDLER ===
-async function handlePayoutSuccess(data) {
-  const { reference, amount, fee } = data;
-
-  try {
-    const withdrawalDoc = await db
-      .collection("withdrawalRequests")
-      .doc(reference)
-      .get();
-
-    if (!withdrawalDoc.exists) {
-      console.log(`Payout transaction not found: ${reference}`);
-      return;
-    }
-
-    const w = withdrawalDoc.data();
-
-    // Skip if already processed
-    if (w.status === "completed") {
-      console.log(`Payout already processed: ${reference}`);
-      return;
-    }
-
-    const userSnap = await db.collection("users").doc(w.userId).get();
-    const user = userSnap.data();
-
-    const batch = db.batch();
-
-    // Update withdrawal request
-    batch.update(withdrawalDoc.ref, {
-      status: "completed",
-      completedAt: admin.firestore.FieldValue.serverTimestamp(),
-      webhookProcessed: true,
-    });
-
-    // Update user transaction
-    const userTxnRef = db
-      .collection("users")
-      .doc(w.userId)
-      .collection("transactions")
-      .doc(reference);
-    batch.update(userTxnRef, {
-      status: "success",
-      webhookProcessed: true,
-    });
-
-    await batch.commit();
-
-    // Send success email
-    await sendEmail(
-      user.email,
-      `Withdrawal Successful - ₦${w.amount.toLocaleString()}`,
-      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
-        <h2 style="color: #10b981;">Withdrawal Completed</h2>
-        <p>Hello <strong>${user.fullName || user.email}</strong>,</p>
-        <p><strong>₦${w.amount.toLocaleString()}</strong> has been successfully sent to your bank account.</p>
-        <p><strong>Account:</strong> ${w.accountName} - ${w.accountNumber}</p>
-        <p><strong>Reference:</strong> ${reference}</p>
-        <p><strong>Fee:</strong> ₦${w.fee?.toLocaleString() || "50"}</p>
-        <p>Thank you for using Highest Data!</p>
-      </div>`
-    );
-
-    console.log(`Payout processed successfully: ${reference}`);
-  } catch (error) {
-    console.error(`Error processing payout success: ${reference}`, error);
-  }
-}
-
-// === PAYOUT FAILED HANDLER ===
-async function handlePayoutFailed(data) {
-  const { reference } = data;
-
-  try {
-    const withdrawalDoc = await db
-      .collection("withdrawalRequests")
-      .doc(reference)
-      .get();
-
-    if (!withdrawalDoc.exists) {
-      console.log(`Failed payout transaction not found: ${reference}`);
-      return;
-    }
-
-    const w = withdrawalDoc.data();
-
-    // Skip if already processed
-    if (w.status === "failed") {
-      console.log(`Payout already marked as failed: ${reference}`);
-      return;
-    }
-
-    const userSnap = await db.collection("users").doc(w.userId).get();
-    const user = userSnap.data();
-
-    const batch = db.batch();
-
-    // Refund wallet balance
-    batch.update(db.collection("users").doc(w.userId), {
-      walletBalance: admin.firestore.FieldValue.increment(w.totalAmount),
-    });
-
-    // Update withdrawal request
-    batch.update(withdrawalDoc.ref, {
-      status: "failed",
-      failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      webhookProcessed: true,
-    });
-
-    // Update user transaction
-    const userTxnRef = db
-      .collection("users")
-      .doc(w.userId)
-      .collection("transactions")
-      .doc(reference);
-    batch.update(userTxnRef, {
-      status: "failed",
-      webhookProcessed: true,
-    });
-
-    await batch.commit();
-
-    // Send failure email
-    await sendEmail(
-      user.email,
-      "Withdrawal Failed - Refunded",
-      `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #eee; border-radius: 10px;">
-        <h2 style="color: #ef4444;">Withdrawal Failed</h2>
-        <p>Hello <strong>${user.fullName || user.email}</strong>,</p>
-        <p>Your withdrawal of <strong>₦${w.amount.toLocaleString()}</strong> has failed.</p>
-        <p><strong>₦${w.totalAmount.toLocaleString()}</strong> has been refunded to your wallet balance.</p>
-        <p><strong>Reference:</strong> ${reference}</p>
-        <p>Please try again or contact support if the issue persists.</p>
-      </div>`
-    );
-
-    console.log(`Payout failed and refunded: ${reference}`);
-  } catch (error) {
-    console.error(`Error processing payout failed: ${reference}`, error);
-  }
-}
-
 // === WEBHOOK FOR eBILLS (async transactions) ===
 app.post("/webhook", async (req, res) => {
   const signature = req.headers["x-signature"];
@@ -2655,598 +2271,359 @@ app.post("/api/withdrawal/verify-otp", async (req, res) => {
   }
 });
 
-// === GET BANKS LIST ===
+//SAFEHAVEN
+
+app.get("/api/safehaven/virtual-account", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    const userId = await verifyFirebaseToken(idToken);
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+
+    // 1. Return existing account if available
+    if (userData.safeHavenAccount) {
+      return res.json({ success: true, account: userData.safeHavenAccount });
+    }
+
+    // 2. Create new Sub-Account if none exists
+    // We need a unique external reference.
+    const extRef = `SUB_${userId}_${Date.now()}`;
+
+    // Using default/placeholder phone if user doesn't have one set, as it's required
+    const payload = {
+      phoneNumber: userData.phoneNumber || "+2348000000000",
+      emailAddress: userData.email,
+      externalReference: extRef,
+      identityType: "BVN",
+      identityNumber: userData.kycData?.bvn || "12345678901", // Make sure to handle unverified users appropriately
+      otp: "123456", // Usually required if not using a whitelisted verification flow. Check your specific SH integration mode.
+      autoSweep: false,
+      autoSweepDetails: { schedule: "Instant", accountNumber: "" },
+    };
+
+    // Note: Creating a sub-account strictly usually requires Identity Verification first
+    // per the docs. If you are using the "Aggregator" model, you might use a different endpoint
+    // or pass verified identity ID. Assuming 'createSubAccountNew' logic here based on docs:
+
+    const { status, data: shData } = await makeSafeHavenRequest(
+      "/accounts/v2/subaccount",
+      "POST",
+      payload
+    );
+
+    if (status === 200 && shData.data) {
+      const accountDetails = {
+        accountNumber: shData.data.accountNumber,
+        accountName: shData.data.accountName,
+        bankName: "Safe Haven MFB",
+        bankCode: "090286",
+        subAccountId: shData.data._id,
+      };
+
+      // Save to user profile
+      await userRef.update({ safeHavenAccount: accountDetails });
+
+      return res.json({ success: true, account: accountDetails });
+    } else {
+      console.error("Failed to create SH Account:", shData);
+      return res
+        .status(400)
+        .json({ error: shData.message || "Failed to generate account" });
+    }
+  } catch (error) {
+    console.error("Virtual Account Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/banks", async (req, res) => {
   try {
-    console.log("Fetching banks from KoraPay...");
+    const { data } = await makeSafeHavenRequest("/transfers/banks");
 
-    const koraRes = await fetch(
-      "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
-      {
-        headers: {
-          Authorization: `Bearer ${KORA_PUBLIC_KEY}`, // Use PUBLIC key for this endpoint
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    console.log("KoraPay banks response status:", koraRes.status);
-
-    const data = await koraRes.json();
-    console.log("KoraPay banks response data received");
-
-    if (koraRes.ok && data.status) {
-      // Format the banks data to match what the frontend expects
-      const formattedBanks = data.data.map((bank) => ({
-        code: bank.code,
-        name: bank.name,
-        nibss_bank_code: bank.nibss_bank_code,
+    if (data.data) {
+      // Map to frontend format
+      const formatted = data.data.map((b) => ({
+        code: b.bankCode,
+        name: b.name,
       }));
-
-      res.json({
-        success: true,
-        data: formattedBanks,
-        message: "Banks fetched successfully",
-      });
+      res.json({ success: true, data: formatted });
     } else {
-      console.error("KoraPay banks API error:", data);
-      res.status(koraRes.status).json({
-        success: false,
-        error: data.message || "Failed to fetch banks from payment provider",
-        koraError: data,
-      });
+      res.status(400).json({ success: false, error: "Could not fetch banks" });
     }
   } catch (error) {
-    console.error("Banks fetch error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error while fetching banks",
-      details: error.message,
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === RESOLVE ACCOUNT NUMBER ===
 app.post("/api/resolve-account", async (req, res) => {
   const { bankCode, accountNumber } = req.body;
-
-  if (!bankCode || !accountNumber) {
-    return res.status(400).json({
-      success: false,
-      error: "Bank code and account number are required",
-    });
-  }
-
   try {
-    console.log("Resolving account:", { bankCode, accountNumber });
-
-    const koraRes = await fetch(
-      "https://api.korapay.com/merchant/api/v1/misc/banks/resolve",
+    const { data } = await makeSafeHavenRequest(
+      "/transfers/name-enquiry",
+      "POST",
       {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${KORA_SECRET_KEY}`, // Use SECRET key for this endpoint
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          bank: bankCode,
-          account: accountNumber,
-        }),
+        bankCode,
+        accountNumber,
       }
     );
 
-    console.log("KoraPay resolve response status:", koraRes.status);
-
-    const data = await koraRes.json();
-    console.log("KoraPay resolve response:", data);
-
-    if (koraRes.ok && data.status) {
+    if (data.data && data.data.accountName) {
       res.json({
         success: true,
-        data: data.data,
-        message: "Account resolved successfully",
+        data: {
+          account_name: data.data.accountName,
+          // Important: We need the sessionId for the transfer later
+          sessionId: data.data.sessionId,
+        },
       });
     } else {
-      console.error("KoraPay resolve API error:", data);
-      res.status(koraRes.status).json({
-        success: false,
-        error: data.message || "Failed to resolve account number",
-        koraError: data,
-      });
+      res.status(400).json({ success: false, error: "Account not found" });
     }
   } catch (error) {
-    console.error("Account resolution error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error while resolving account",
-      details: error.message,
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === WITHDRAWAL: Process (User submits) ===
-// === WITHDRAWAL: Process (User submits) ===
 app.post("/api/withdrawal/process", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
 
-  let userId;
   try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch {
-    return res.status(401).json({ error: "Invalid token" });
-  }
+    const userId = await verifyFirebaseToken(idToken);
+    const { amount, bankCode, accountNumber, accountName } = req.body;
 
-  const { amount, bankCode, accountNumber, accountName } = req.body;
-  const withdrawalAmount = parseFloat(amount);
-  const FEE = 50;
-  const totalAmount = withdrawalAmount + FEE;
+    // 1. Validate Balance
+    const withdrawalAmount = parseFloat(amount);
+    const FEE = 50;
+    const totalDeduct = withdrawalAmount + FEE;
 
-  const userDoc = await db.collection("users").doc(userId).get();
-  const userData = userDoc.data();
-
-  if (totalAmount > userData.walletBalance)
-    return res.status(400).json({ error: "Insufficient balance" });
-
-  const reference = `WDR_${userId}_${Date.now()}`;
-
-  // First, get the bank name from the bank code
-  const bank = await db.collection("banks").doc(bankCode).get();
-  let bankName = "Unknown Bank";
-
-  if (bank.exists) {
-    bankName = bank.data().name;
-  } else {
-    // If we don't have the bank name, we need to fetch it from KoraPay
-    try {
-      const banksRes = await fetch(
-        "https://api.korapay.com/merchant/api/v1/misc/banks?countryCode=NG",
-        {
-          headers: {
-            Authorization: `Bearer ${KORA_PUBLIC_KEY}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-
-      const banksData = await banksRes.json();
-      if (banksData.status) {
-        const bankInfo = banksData.data.find((b) => b.code === bankCode);
-        if (bankInfo) {
-          bankName = bankInfo.name;
-          // Cache the bank name for future use
-          await db.collection("banks").doc(bankCode).set({
-            name: bankInfo.name,
-            code: bankCode,
-          });
-        }
-      }
-    } catch (error) {
-      console.error("Failed to fetch bank name:", error);
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+    if (userDoc.data().walletBalance < totalDeduct) {
+      return res.status(400).json({ error: "Insufficient balance" });
     }
-  }
 
-  const batch = db.batch();
+    // 2. Perform Name Enquiry to get SessionID (Required by Safe Haven for Transfer)
+    // Even if frontend did it, we do it again to get a fresh SessionID for security
+    const enquiryRes = await makeSafeHavenRequest(
+      "/transfers/name-enquiry",
+      "POST",
+      {
+        bankCode,
+        accountNumber,
+      }
+    );
 
-  // Deduct from wallet
-  batch.update(db.collection("users").doc(userId), {
-    walletBalance: admin.firestore.FieldValue.increment(-totalAmount),
-  });
+    if (!enquiryRes.data.data || !enquiryRes.data.data.sessionId) {
+      return res
+        .status(400)
+        .json({ error: "Failed to verify account session" });
+    }
+    const sessionId = enquiryRes.data.data.sessionId;
+    const reference = `WDR_${userId}_${Date.now()}`;
 
-  // Create withdrawal request
-  batch.set(db.collection("withdrawalRequests").doc(reference), {
-    userId,
-    reference,
-    amount: withdrawalAmount,
-    totalAmount,
-    fee: FEE,
-    bankCode,
-    bankName,
-    accountNumber,
-    accountName,
-    status: "processing",
-    userEmail: userData.email,
-    userName: userData.fullName || userData.email,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+    // 3. Deduct Wallet & Create Records (Optimistic Update)
+    const batch = db.batch();
 
-  // Create user transaction record
-  batch.set(
-    db
-      .collection("users")
-      .doc(userId)
-      .collection("transactions")
-      .doc(reference),
-    {
+    batch.update(userRef, {
+      walletBalance: admin.firestore.FieldValue.increment(-totalDeduct),
+    });
+
+    const txnRef = userRef.collection("transactions").doc(reference);
+    batch.set(txnRef, {
       userId,
       reference,
-      description: `Withdrawal to ${accountName}`,
-      amount: -totalAmount,
       type: "debit",
+      description: `Withdrawal to ${accountName}`,
+      amount: -totalDeduct,
       status: "processing",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    }
-  );
+    });
 
-  await batch.commit();
-
-  // Prepare the disbursement request according to KoraPay docs
-  const disbursementData = {
-    reference,
-    destination: {
-      type: "bank_account",
-      amount: withdrawalAmount,
-      currency: "NGN",
-      narration: "Withdrawal from Highest Data",
-      bank_account: {
-        bank_name: bankName,
-        account: accountNumber,
-        account_name: accountName,
-        beneficiary_type: "individual",
-        first_name: accountName.split(" ")[0] || accountName,
-        last_name: accountName.split(" ").slice(1).join(" ") || accountName,
-        account_number_type: "account_number",
-      },
-      customer: {
-        name: userData.fullName || userData.email,
-        email: userData.email,
-      },
-    },
-  };
-
-  console.log(
-    "Sending disbursement request:",
-    JSON.stringify(disbursementData, null, 2)
-  );
-
-  try {
-    const koraRes = await fetch(
-      "https://api.korapay.com/merchant/api/v1/transactions/disburse",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${KORA_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(disbursementData),
-      }
-    );
-
-    const koraData = await koraRes.json();
-    console.log(
-      "KoraPay disbursement response:",
-      JSON.stringify(koraData, null, 2)
-    );
-
-    if (!koraRes.ok || !koraData.status) {
-      console.error("KoraPay disbursement failed:", koraData);
-
-      // Refund on failure
-      const refundBatch = db.batch();
-      refundBatch.update(db.collection("users").doc(userId), {
-        walletBalance: admin.firestore.FieldValue.increment(totalAmount),
-      });
-      refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
-        status: "failed",
-        failureReason: koraData.message || "Payout initiation failed",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      refundBatch.update(
-        db
-          .collection("users")
-          .doc(userId)
-          .collection("transactions")
-          .doc(reference),
-        { status: "failed" }
-      );
-      await refundBatch.commit();
-
-      return res.status(400).json({
-        error: koraData.message || "Payout failed to initiate",
-        koraError: koraData,
-      });
-    }
-
-    // Update with KoraPay transaction details
-    await db
-      .collection("withdrawalRequests")
-      .doc(reference)
-      .update({
-        koraReference: koraData.data?.reference,
-        koraFee: koraData.data?.fee,
-        status: koraData.data?.status || "processing",
-      });
-
-    res.json({
-      success: true,
+    const reqRef = db.collection("withdrawalRequests").doc(reference);
+    batch.set(reqRef, {
+      userId,
       reference,
-      message: "Withdrawal processing started",
-      koraResponse: koraData,
+      amount: withdrawalAmount,
+      totalDeduct,
+      fee: FEE,
+      bankCode,
+      accountNumber,
+      accountName,
+      status: "processing",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-  } catch (error) {
-    console.error("KoraPay network error:", error);
 
-    // Refund on network error
-    const refundBatch = db.batch();
-    refundBatch.update(db.collection("users").doc(userId), {
-      walletBalance: admin.firestore.FieldValue.increment(totalAmount),
-    });
-    refundBatch.update(db.collection("withdrawalRequests").doc(reference), {
-      status: "failed",
-      failureReason: "Network error during payout initiation",
-      failedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    refundBatch.update(
-      db
-        .collection("users")
-        .doc(userId)
-        .collection("transactions")
-        .doc(reference),
-      { status: "failed" }
-    );
-    await refundBatch.commit();
+    await batch.commit();
 
-    res.status(500).json({
-      error: "Failed to initiate payout due to network error",
-      details: error.message,
-    });
-  }
-});
-
-// === KYC: BVN VERIFICATION WITH KORAPAY ===
-app.post("/api/kyc/verify-bvn", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid token" });
-  }
-
-  const { bvn, firstName, lastName, middleName, phone, dob, gender } = req.body;
-
-  // Validate required fields
-  if (!bvn || !firstName || !lastName) {
-    return res.status(400).json({
-      success: false,
-      error: "BVN, first name, and last name are required",
-    });
-  }
-
-  if (bvn.length !== 11 || !/^\d+$/.test(bvn)) {
-    return res.status(400).json({
-      success: false,
-      error: "BVN must be exactly 11 digits",
-    });
-  }
-
-  try {
-    console.log("Starting BVN verification for user:", userId);
-
-    // Get user data from Firestore
-    const userDoc = await db.collection("users").doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
-    }
-
-    const userData = userDoc.data();
-
-    // Check if KYC is already approved
-    if (userData.kycStatus === "approved") {
-      return res.status(400).json({
-        success: false,
-        error: "KYC already approved",
-      });
-    }
-
-    // Call KoraPay BVN verification API
-    console.log("Calling KoraPay BVN verification...");
-    const koraRes = await fetch(
-      "https://api.korapay.com/merchant/api/v1/identities/ng/bvn",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${KORA_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          id: bvn,
-          verification_consent: true,
-        }),
-      }
-    );
-
-    const koraData = await koraRes.json();
-    console.log("KoraPay BVN response:", JSON.stringify(koraData, null, 2));
-
-    if (!koraRes.ok || !koraData.status) {
-      console.error("KoraPay BVN verification failed:", koraData);
-
-      // Update user KYC status to rejected
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          kycStatus: "rejected",
-          rejectionReason: koraData.message || "BVN verification failed",
-          lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-      return res.status(400).json({
-        success: false,
-        error: koraData.message || "BVN verification failed",
-        koraError: koraData,
-      });
-    }
-
-    // BVN verification successful - validate returned data matches user input
-    const bvnData = koraData.data;
-    const validationErrors = [];
-
-    // Validate first name (case insensitive, allow for minor variations)
-    if (
-      !bvnData.first_name ||
-      !bvnData.first_name.toLowerCase().includes(firstName.toLowerCase())
-    ) {
-      validationErrors.push("First name doesn't match BVN records");
-    }
-
-    // Validate last name (case insensitive, allow for minor variations)
-    if (
-      !bvnData.last_name ||
-      !bvnData.last_name.toLowerCase().includes(lastName.toLowerCase())
-    ) {
-      validationErrors.push("Last name doesn't match BVN records");
-    }
-
-    // Validate date of birth if provided
-    if (dob && bvnData.date_of_birth && dob !== bvnData.date_of_birth) {
-      validationErrors.push("Date of birth doesn't match BVN records");
-    }
-
-    if (validationErrors.length > 0) {
-      console.error("BVN data validation failed:", validationErrors);
-
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          kycStatus: "rejected",
-          rejectionReason: validationErrors.join(", "),
-          lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-      return res.status(400).json({
-        success: false,
-        error: "Information doesn't match BVN records",
-        errors: validationErrors,
-        bvnData: {
-          firstName: bvnData.first_name,
-          lastName: bvnData.last_name,
-          dob: bvnData.date_of_birth,
-        },
-      });
-    }
-
-    // KYC successful - update user KYC status only
-    const fullName = middleName
-      ? `${firstName} ${middleName} ${lastName}`
-      : `${firstName} ${lastName}`;
-
-    const updateData = {
-      kycStatus: "approved",
-      displayName: fullName,
-      kycData: {
-        firstName,
-        lastName,
-        middleName: middleName || null,
-        phone: phone || null,
-        dob: dob || null,
-        gender: gender || null,
-        bvn: bvn, // Store securely
-        verifiedAt: new Date().toISOString(),
-      },
-      bvnVerificationData: {
-        reference: bvnData.reference,
-        koraVerifiedAt: new Date().toISOString(),
-        bvnFirstname: bvnData.first_name,
-        bvnLastname: bvnData.last_name,
-        bvnDob: bvnData.date_of_birth,
-        bvnPhone: bvnData.phone_number,
-        bvnGender: bvnData.gender,
-      },
-      lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+    // 4. Initiate Transfer with Safe Haven
+    const transferPayload = {
+      nameEnquiryReference: sessionId,
+      debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Your main Safe Haven account number
+      beneficiaryBankCode: bankCode,
+      beneficiaryAccountNumber: accountNumber,
+      amount: withdrawalAmount,
+      saveBeneficiary: false,
+      narration: `Withdrawal Ref ${reference}`,
+      paymentReference: reference,
     };
 
-    await db.collection("users").doc(userId).update(updateData);
+    const { status, data: transferData } = await makeSafeHavenRequest(
+      "/transfers",
+      "POST",
+      transferPayload
+    );
 
-    console.log("KYC approved for user:", userId);
-
-    res.json({
-      success: true,
-      message: "KYC verification successful",
-      data: {
-        reference: bvnData.reference,
-        firstName: bvnData.first_name,
-        lastName: bvnData.last_name,
-        dob: bvnData.date_of_birth,
-        phone: bvnData.phone_number,
-      },
-    });
-  } catch (error) {
-    console.error("KYC verification error:", error);
-
-    // Update user KYC status to rejected on error
-    try {
-      await db.collection("users").doc(userId).update({
-        kycStatus: "rejected",
-        rejectionReason: "Internal server error during verification",
-        lastKycAttempt: admin.firestore.FieldValue.serverTimestamp(),
+    if (status === 200 && transferData.data) {
+      // Update records with provider reference
+      await reqRef.update({
+        providerRef: transferData.data.sessionId, // Safe Haven uses SessionId as ref often
+        status: "processing",
       });
-    } catch (dbError) {
-      console.error("Failed to update user KYC status:", dbError);
-    }
 
-    res.status(500).json({
-      success: false,
-      error: "Internal server error during KYC verification",
-      details: error.message,
-    });
+      res.json({ success: true, message: "Transfer initiated successfully" });
+    } else {
+      // 5. Rollback on Failure
+      const rollbackBatch = db.batch();
+      rollbackBatch.update(userRef, {
+        walletBalance: admin.firestore.FieldValue.increment(totalDeduct),
+      });
+      rollbackBatch.update(txnRef, { status: "failed" });
+      rollbackBatch.update(reqRef, {
+        status: "failed",
+        reason: transferData.message,
+      });
+      await rollbackBatch.commit();
+
+      res
+        .status(400)
+        .json({ error: "Transfer initiation failed", details: transferData });
+    }
+  } catch (error) {
+    console.error("Withdrawal Error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === KYC: GET USER KYC STATUS ===
-app.get("/api/kyc/status", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid token" });
-  }
+app.post("/webhooks", async (req, res) => {
+  const payload = req.body;
+  console.log("Safe Haven Webhook:", JSON.stringify(payload, null, 2));
 
   try {
-    const userDoc = await db.collection("users").doc(userId).get();
+    // === 1. FUNDING (Inwards Transfer) ===
+    // Safe Haven event type for incoming money to Virtual Account
+    if (
+      payload.type === "virtualAccount.transfer" ||
+      (payload.data && payload.data.type === "Inwards")
+    ) {
+      const data = payload.data;
+      const amount = data.amount;
+      const ref = data.paymentReference;
+      const accountNum = data.creditAccountNumber; // The Virtual Account Number
 
-    if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
+      // Find user who owns this Virtual Account
+      // You might want to create a 'virtualAccounts' collection to map Number -> UserId for faster lookups
+      // Or query users collection where safeHavenAccount.accountNumber == accountNum
+      const userQuery = await db
+        .collection("users")
+        .where("safeHavenAccount.accountNumber", "==", accountNum)
+        .limit(1)
+        .get();
+
+      if (!userQuery.empty) {
+        const userDoc = userQuery.docs[0];
+        const userId = userDoc.id;
+
+        // Check if transaction already processed
+        const txnCheck = await userDoc.ref
+          .collection("transactions")
+          .doc(ref)
+          .get();
+        if (txnCheck.exists) {
+          return res.status(200).send("Duplicate");
+        }
+
+        const batch = db.batch();
+        batch.update(userDoc.ref, {
+          walletBalance: admin.firestore.FieldValue.increment(amount),
+        });
+
+        batch.set(userDoc.ref.collection("transactions").doc(ref), {
+          userId,
+          reference: ref,
+          type: "credit",
+          amount: amount,
+          description: `Wallet Funding via Transfer from ${
+            data.debitAccountName || "Bank"
+          }`,
+          status: "success",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          webhookData: data,
+        });
+
+        await batch.commit();
+        console.log(`Credited N${amount} to user ${userId}`);
+      }
     }
 
-    const userData = userDoc.data();
+    // === 2. WITHDRAWAL STATUS (Outwards Transfer) ===
+    if (payload.type === "transfer" && payload.data.type === "Outwards") {
+      const data = payload.data;
+      const ref = data.paymentReference; // We sent our Ref here
+      const status = data.status; // "Completed" or "Failed"
 
-    res.json({
-      success: true,
-      data: {
-        kycStatus: userData.kycStatus || "pending",
-        displayName: userData.displayName,
-        email: userData.email,
-        kycData: userData.kycData || null,
-        rejectionReason: userData.rejectionReason || null,
-        lastKycAttempt: userData.lastKycAttempt || null,
-      },
-    });
-  } catch (error) {
-    console.error("Get KYC status error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to get KYC status",
-    });
+      const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
+
+      if (reqDoc.exists && reqDoc.data().status === "processing") {
+        const userId = reqDoc.data().userId;
+        const totalDeduct = reqDoc.data().totalDeduct;
+
+        if (status === "Completed") {
+          await reqDoc.ref.update({
+            status: "success",
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          await db
+            .collection("users")
+            .doc(userId)
+            .collection("transactions")
+            .doc(ref)
+            .update({ status: "success" });
+          // Trigger Email here...
+        } else if (status === "Failed" || status === "Reversed") {
+          // Refund User
+          const batch = db.batch();
+          batch.update(db.collection("users").doc(userId), {
+            walletBalance: admin.firestore.FieldValue.increment(totalDeduct),
+          });
+          batch.update(reqDoc.ref, {
+            status: "failed",
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          batch.update(
+            db
+              .collection("users")
+              .doc(userId)
+              .collection("transactions")
+              .doc(ref),
+            { status: "failed" }
+          );
+          await batch.commit();
+        }
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook Error:", err);
+    res.sendStatus(500);
   }
 });
 
@@ -3264,7 +2641,7 @@ app.get("/health", (req, res) => {
 app.get("/webhook/test", (req, res) => {
   res.json({
     message: "Webhook endpoint is accessible",
-    urls: ["/webhook/kora", "/webhook/vtu"],
+    urls: ["/webhook/vtu"],
     method: "POST",
   });
 });
