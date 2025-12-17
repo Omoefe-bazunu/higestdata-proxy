@@ -110,7 +110,7 @@ async function getSafeHavenToken() {
     // 1. Generate fresh assertion automatically
     const assertion = generateClientAssertion();
 
-    [cite_start]; // 2. Exchange for Access Token [cite: 1, 3]
+    // 2. Exchange for Access Token [cite: 1, 3]
     const response = await fetch(SH_AUTH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -137,7 +137,7 @@ async function getSafeHavenToken() {
     }
 
     shAccessToken = data.access_token;
-    [cite_start]; // Store expiry (expires_in is in seconds, usually ~2399s) [cite: 4]
+    // Store expiry (expires_in is in seconds, usually ~2399s) [cite: 4]
     shTokenExpiry = now + data.expires_in * 1000;
 
     console.log(
