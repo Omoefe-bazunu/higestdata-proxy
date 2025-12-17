@@ -30,8 +30,8 @@ const OGAVIRAL_API_URL = "https://ogaviral.com/api/v2";
 const OGAVIRAL_API_KEY = process.env.OGAVIRAL_API_KEY;
 
 // === SAFE HAVEN CONFIG ===
-const SH_AUTH_URL = "https://api.sandbox.safehavenmfb.com/oauth2/token";
-const SH_API_URL = "https://api.sandbox.safehavenmfb.com";
+const SH_AUTH_URL = "https://api.safehavenmfb.com/oauth2/token";
+const SH_API_URL = "https://api.safehavenmfb.com";
 const SH_CLIENT_ID = process.env.SAFE_HAVEN_CLIENT_ID; // From dashboard
 const SH_ASSERTION = process.env.SAFE_HAVEN_ASSERTION; // The JWT assertion string
 // Note: In production, you should generate the assertion dynamically using your Private Key.
