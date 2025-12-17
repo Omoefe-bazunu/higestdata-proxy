@@ -2483,6 +2483,9 @@ app.post("/api/resolve-account", async (req, res) => {
   }
 });
 
+// ==========================================
+// 1. WITHDRAWAL PROCESS ROUTE (Double-Spend Fixed)
+// ==========================================
 app.post("/api/withdrawal/process", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2493,19 +2496,18 @@ app.post("/api/withdrawal/process", async (req, res) => {
     const userId = await verifyFirebaseToken(idToken);
     const { amount, bankCode, accountNumber, accountName } = req.body;
 
-    // 1. Validate Balance
     const withdrawalAmount = parseFloat(amount);
     const FEE = 50;
     const totalDeduct = withdrawalAmount + FEE;
 
+    // 1. Validate Balance
     const userRef = db.collection("users").doc(userId);
     const userDoc = await userRef.get();
     if (userDoc.data().walletBalance < totalDeduct) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // 2. Perform Name Enquiry to get SessionID (Required by Safe Haven for Transfer)
-    // Even if frontend did it, we do it again to get a fresh SessionID for security
+    // 2. Name Enquiry (Get Session ID)
     const enquiryRes = await makeSafeHavenRequest(
       "/transfers/name-enquiry",
       "POST",
@@ -2521,11 +2523,11 @@ app.post("/api/withdrawal/process", async (req, res) => {
         .json({ error: "Failed to verify account session" });
     }
     const sessionId = enquiryRes.data.data.sessionId;
-    // Generate a shorter reference (Max 30 chars for NIP compliance)
-    // WDR + First 5 of UserID + Timestamp (13) = ~22 chars
+
+    // Shortened Reference (Max 30 chars for NIBSS compliance)
     const reference = `WDR-${userId.substring(0, 5)}-${Date.now()}`;
 
-    // 3. Deduct Wallet & Create Records (Optimistic Update)
+    // 3. DEDUCT WALLET FIRST (Optimistic Update)
     const batch = db.batch();
 
     batch.update(userRef, {
@@ -2559,21 +2561,11 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
     await batch.commit();
 
-    // 4. Initiate Transfer with Safe Haven
+    // 4. Initiate Transfer
     const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
-
-    if (!DEBIT_ACCOUNT) {
-      console.error(
-        "CRITICAL ERROR: SAFE_HAVEN_MAIN_ACCOUNT is missing in .env"
-      );
-      return res
-        .status(500)
-        .json({ error: "Server misconfiguration: Missing Main Account" });
-    }
-
     const transferPayload = {
       nameEnquiryReference: sessionId,
-      debitAccountNumber: DEBIT_ACCOUNT, // Must be your 10-digit Safe Haven Account
+      debitAccountNumber: DEBIT_ACCOUNT,
       beneficiaryBankCode: bankCode,
       beneficiaryAccountNumber: accountNumber,
       amount: withdrawalAmount,
@@ -2582,161 +2574,141 @@ app.post("/api/withdrawal/process", async (req, res) => {
       paymentReference: reference,
     };
 
-    // DEBUG LOG: Check Render logs to see exactly what is being sent
-    console.log(
-      "Sending Transfer Payload:",
-      JSON.stringify(transferPayload, null, 2)
-    );
+    console.log("Sending Transfer:", JSON.stringify(transferPayload));
 
+    // Call Safe Haven
     const { status, data: transferData } = await makeSafeHavenRequest(
       "/transfers",
       "POST",
       transferPayload
     );
 
-    if (status === 200 && transferData.data) {
-      // Update records with provider reference
+    console.log(`SH Response Status: ${status}`, JSON.stringify(transferData));
+
+    // === CRITICAL FIX: ACCEPT 200, 201, or 202 ===
+    if (status >= 200 && status < 300 && transferData.data) {
       await reqRef.update({
-        providerRef: transferData.data.sessionId, // Safe Haven uses SessionId as ref often
+        providerRef: transferData.data.sessionId,
         status: "processing",
       });
-
-      res.json({ success: true, message: "Transfer initiated successfully" });
+      return res.json({
+        success: true,
+        message: "Transfer initiated successfully",
+      });
     } else {
-      // 5. Rollback on Failure
-      const rollbackBatch = db.batch();
-      rollbackBatch.update(userRef, {
-        walletBalance: admin.firestore.FieldValue.increment(totalDeduct),
-      });
-      rollbackBatch.update(txnRef, { status: "failed" });
-      rollbackBatch.update(reqRef, {
-        status: "failed",
-        reason: transferData.message,
-      });
-      await rollbackBatch.commit();
+      // === SAFETY NET: NEVER REFUND AUTOMATICALLY ON API ERROR ===
+      // Mark as manual review so you don't lose money if the request actually went through.
+      console.error(
+        "Transfer API Ambiguous/Failed. Marking for Manual Review."
+      );
 
-      res
-        .status(400)
-        .json({ error: "Transfer initiation failed", details: transferData });
+      await reqRef.update({
+        status: "manual_review",
+        apiError: transferData.message || "Unknown API Error",
+        apiResponse: JSON.stringify(transferData),
+      });
+
+      return res.json({
+        success: true,
+        message: "Transfer queued for processing.",
+      });
     }
   } catch (error) {
-    console.error("Withdrawal Error:", error);
-    res.status(500).json({ error: error.message });
+    console.error("Withdrawal Critical Error:", error);
+    res
+      .status(500)
+      .json({ error: "Processing error. Please contact support." });
   }
 });
 
+// ==========================================
+// WEBHOOK HANDLER (Withdrawals Only)
+// ==========================================
 app.post("/webhooks", async (req, res) => {
+  // 1. Acknowledge IMMEDIATELY to stop retries
+  res.sendStatus(200);
+
   const payload = req.body;
-  console.log("Safe Haven Webhook:", JSON.stringify(payload, null, 2));
+
+  // Optional: Log only relevant events to keep logs clean
+  if (payload.type === "transfer" || payload.eventType === "account.debit") {
+    console.log("Webhook Received:", JSON.stringify(payload));
+  }
 
   try {
-    // === 1. FUNDING (Inwards Transfer) ===
-    // Safe Haven event type for incoming money to Virtual Account
-    if (
-      payload.type === "virtualAccount.transfer" ||
-      (payload.data && payload.data.type === "Inwards")
-    ) {
-      const data = payload.data;
-      const amount = data.amount;
+    const data = payload.data;
+    if (!data) return;
+
+    // We only care about OUTWARDS transfers (Withdrawals)
+    if (data.type === "Outwards") {
       const ref = data.paymentReference;
-      const accountNum = data.creditAccountNumber; // The Virtual Account Number
-
-      // Find user who owns this Virtual Account
-      // You might want to create a 'virtualAccounts' collection to map Number -> UserId for faster lookups
-      // Or query users collection where safeHavenAccount.accountNumber == accountNum
-      const userQuery = await db
-        .collection("users")
-        .where("safeHavenAccount.accountNumber", "==", accountNum)
-        .limit(1)
-        .get();
-
-      if (!userQuery.empty) {
-        const userDoc = userQuery.docs[0];
-        const userId = userDoc.id;
-
-        // Check if transaction already processed
-        const txnCheck = await userDoc.ref
-          .collection("transactions")
-          .doc(ref)
-          .get();
-        if (txnCheck.exists) {
-          return res.status(200).send("Duplicate");
-        }
-
-        const batch = db.batch();
-        batch.update(userDoc.ref, {
-          walletBalance: admin.firestore.FieldValue.increment(amount),
-        });
-
-        batch.set(userDoc.ref.collection("transactions").doc(ref), {
-          userId,
-          reference: ref,
-          type: "credit",
-          amount: amount,
-          description: `Wallet Funding via Transfer from ${
-            data.debitAccountName || "Bank"
-          }`,
-          status: "success",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          webhookData: data,
-        });
-
-        await batch.commit();
-        console.log(`Credited N${amount} to user ${userId}`);
-      }
-    }
-
-    // === 2. WITHDRAWAL STATUS (Outwards Transfer) ===
-    if (payload.type === "transfer" && payload.data.type === "Outwards") {
-      const data = payload.data;
-      const ref = data.paymentReference; // We sent our Ref here
-      const status = data.status; // "Completed" or "Failed"
+      const status = data.status; // "Completed", "Successful", "Failed"
 
       const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
 
-      if (reqDoc.exists && reqDoc.data().status === "processing") {
-        const userId = reqDoc.data().userId;
-        const totalDeduct = reqDoc.data().totalDeduct;
+      if (reqDoc.exists) {
+        const docData = reqDoc.data();
+        const userId = docData.userId;
 
-        if (status === "Completed") {
-          await reqDoc.ref.update({
-            status: "success",
-            completedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          await db
-            .collection("users")
-            .doc(userId)
-            .collection("transactions")
-            .doc(ref)
-            .update({ status: "success" });
-          // Trigger Email here...
-        } else if (status === "Failed" || status === "Reversed") {
-          // Refund User
-          const batch = db.batch();
-          batch.update(db.collection("users").doc(userId), {
-            walletBalance: admin.firestore.FieldValue.increment(totalDeduct),
-          });
-          batch.update(reqDoc.ref, {
-            status: "failed",
-            failedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          batch.update(
-            db
-              .collection("users")
-              .doc(userId)
-              .collection("transactions")
-              .doc(ref),
-            { status: "failed" }
-          );
-          await batch.commit();
+        // Only update if the status is still pending/processing
+        if (
+          docData.status === "processing" ||
+          docData.status === "manual_review"
+        ) {
+          if (status === "Completed" || status === "Successful") {
+            // SUCCESS: Mark DB as success
+            const batch = db.batch();
+            batch.update(reqDoc.ref, {
+              status: "success",
+              completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            batch.update(
+              db
+                .collection("users")
+                .doc(userId)
+                .collection("transactions")
+                .doc(ref),
+              {
+                status: "success",
+              }
+            );
+            await batch.commit();
+            console.log(`Withdrawal ${ref} SUCCESS.`);
+          } else if (status === "Failed" || status === "Reversed") {
+            // FAILURE: Refund the user
+            const batch = db.batch();
+            batch.update(db.collection("users").doc(userId), {
+              walletBalance: admin.firestore.FieldValue.increment(
+                docData.totalDeduct
+              ),
+            });
+            batch.update(reqDoc.ref, {
+              status: "failed",
+              failedAt: admin.firestore.FieldValue.serverTimestamp(),
+              reason: "Webhook Failed",
+            });
+            batch.update(
+              db
+                .collection("users")
+                .doc(userId)
+                .collection("transactions")
+                .doc(ref),
+              {
+                status: "failed",
+              }
+            );
+            await batch.commit();
+            console.log(`Withdrawal ${ref} FAILED. User Refunded.`);
+          }
         }
+      } else {
+        // This might happen if you trigger a transfer manually from the SH Dashboard
+        console.log(`Ignored Outwards Transfer ${ref} (Not found in DB)`);
       }
     }
-
-    res.sendStatus(200);
+    // "Inwards" (Funding) is now completely ignored.
   } catch (err) {
-    console.error("Webhook Error:", err);
-    res.sendStatus(500);
+    console.error("Webhook Logic Error:", err);
   }
 });
 
