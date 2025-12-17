@@ -2558,9 +2558,20 @@ app.post("/api/withdrawal/process", async (req, res) => {
     await batch.commit();
 
     // 4. Initiate Transfer with Safe Haven
+    const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+
+    if (!DEBIT_ACCOUNT) {
+      console.error(
+        "CRITICAL ERROR: SAFE_HAVEN_MAIN_ACCOUNT is missing in .env"
+      );
+      return res
+        .status(500)
+        .json({ error: "Server misconfiguration: Missing Main Account" });
+    }
+
     const transferPayload = {
       nameEnquiryReference: sessionId,
-      debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Your main Safe Haven account number
+      debitAccountNumber: DEBIT_ACCOUNT, // Must be your 10-digit Safe Haven Account
       beneficiaryBankCode: bankCode,
       beneficiaryAccountNumber: accountNumber,
       amount: withdrawalAmount,
@@ -2568,6 +2579,12 @@ app.post("/api/withdrawal/process", async (req, res) => {
       narration: `Withdrawal Ref ${reference}`,
       paymentReference: reference,
     };
+
+    // DEBUG LOG: Check Render logs to see exactly what is being sent
+    console.log(
+      "Sending Transfer Payload:",
+      JSON.stringify(transferPayload, null, 2)
+    );
 
     const { status, data: transferData } = await makeSafeHavenRequest(
       "/transfers",
