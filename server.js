@@ -2521,7 +2521,9 @@ app.post("/api/withdrawal/process", async (req, res) => {
         .json({ error: "Failed to verify account session" });
     }
     const sessionId = enquiryRes.data.data.sessionId;
-    const reference = `WDR_${userId}_${Date.now()}`;
+    // Generate a shorter reference (Max 30 chars for NIP compliance)
+    // WDR + First 5 of UserID + Timestamp (13) = ~22 chars
+    const reference = `WDR-${userId.substring(0, 5)}-${Date.now()}`;
 
     // 3. Deduct Wallet & Create Records (Optimistic Update)
     const batch = db.batch();
