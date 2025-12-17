@@ -6,6 +6,8 @@ require("dotenv").config();
 const admin = require("firebase-admin");
 // NOTE: If you get an error saying "require() of ES Module", change this to a dynamic import inside the route (shown in comments below)
 const MailerLite = require("@mailerlite/mailerlite-nodejs").default;
+const fs = require("fs");
+const path = require("path");
 
 // // Inside the route handler...
 // const MailerLite = (await import('@mailerlite/mailerlite-nodejs')).default;
@@ -38,10 +40,35 @@ const SH_ISSUER = "https://www.highestdata.com.ng"; // "iss" (Your Company URL)
 
 const SH_CLIENT_ID = process.env.SAFE_HAVEN_CLIENT_ID;
 
-// Handle Private Key Newlines (Fix for Render Environment Variables)
-const SH_PRIVATE_KEY = process.env.SAFE_HAVEN_PRIVATE_KEY
-  ? process.env.SAFE_HAVEN_PRIVATE_KEY.replace(/\\n/g, "\n")
-  : null;
+// === LOAD PRIVATE KEY ===
+let SH_PRIVATE_KEY;
+
+try {
+  // Look for privatekey.pem in the same folder as server.js
+  const keyPath = path.join(__dirname, "privatekey.pem");
+
+  if (fs.existsSync(keyPath)) {
+    SH_PRIVATE_KEY = fs.readFileSync(keyPath, "utf8");
+    console.log("✅ Loaded Safe Haven Private Key from file.");
+  } else {
+    // Fallback to Env Var if file is missing (e.g. in some cloud setups)
+    console.warn(
+      "⚠️ privatekey.pem not found locally. Checking Environment Variables..."
+    );
+    if (process.env.SAFE_HAVEN_PRIVATE_KEY) {
+      SH_PRIVATE_KEY = process.env.SAFE_HAVEN_PRIVATE_KEY.replace(/\\n/g, "\n");
+    }
+  }
+} catch (err) {
+  console.error("❌ Failed to load Private Key:", err.message);
+}
+
+// Validation check
+if (!SH_PRIVATE_KEY) {
+  console.error(
+    "❌ CRITICAL: No Safe Haven Private Key found! Auth will fail."
+  );
+}
 
 let shAccessToken = null;
 let shTokenExpiry = 0;
@@ -49,20 +76,20 @@ let shTokenExpiry = 0;
 // === GENERATE DYNAMIC ASSERTION ===
 function generateClientAssertion() {
   if (!SH_PRIVATE_KEY)
-    throw new Error("SAFE_HAVEN_PRIVATE_KEY is missing in env");
+    throw new Error(
+      "Private Key not found. Check /etc/secrets/private.pem or ENV variables."
+    );
 
   const now = Math.floor(Date.now() / 1000);
 
-  // Payload strictly following Safe Haven Docs
   const payload = {
-    iss: SH_ISSUER, // Your Company URL
-    sub: SH_CLIENT_ID, // OAuth Client ID
-    aud: SH_AUDIENCE, // Safe Haven Environment URL
-    iat: now, // Issued At (Current Time)
-    exp: now + 3600, // Expiry (Current Time + 1 Hour)
+    iss: SH_ISSUER,
+    sub: SH_CLIENT_ID,
+    aud: SH_AUDIENCE,
+    iat: now,
+    exp: now + 3600,
   };
 
-  // Sign with RS256 and include "typ": "JWT" in header
   return jwt.sign(payload, SH_PRIVATE_KEY, {
     algorithm: "RS256",
     header: { typ: "JWT" },
