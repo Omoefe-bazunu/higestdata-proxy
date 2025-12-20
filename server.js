@@ -2036,15 +2036,13 @@ app.post("/api/smm/order", async (req, res) => {
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // 1. Get Service Details to Calculate Price
-    // (In production, cache services or fetch specific one to avoid fetching all 2000+ every time)
+    // 1. Fetch service to validate and get current provider rate
     const services = await makeOgaviralRequest("services");
     const selectedService = services.find((s) => s.service == serviceId);
 
     if (!selectedService)
       return res.status(400).json({ error: "Service not found or disabled" });
 
-    // Validate Quantity
     if (
       quantity < parseInt(selectedService.min) ||
       quantity > parseInt(selectedService.max)
@@ -2054,13 +2052,12 @@ app.post("/api/smm/order", async (req, res) => {
       });
     }
 
-    // 2. Calculate Cost
+    // 2. Calculate Costs
     const settingsDoc = await db.collection("settings").doc("smmRates").get();
     const profitPercentage = settingsDoc.exists
       ? settingsDoc.data().profitPercentage
       : 20;
 
-    // Rate is per 1000. Formula: (Rate * Quantity) / 1000
     const providerCost = (parseFloat(selectedService.rate) * quantity) / 1000;
     const userCost = providerCost * (1 + profitPercentage / 100);
 
@@ -2068,7 +2065,7 @@ app.post("/api/smm/order", async (req, res) => {
       return res.status(400).json({ error: "Insufficient wallet balance" });
     }
 
-    // 3. Place Order with OgaViral
+    // 3. Place Order with Provider
     const orderResponse = await makeOgaviralRequest("add", {
       service: serviceId,
       link: link,
@@ -2076,51 +2073,55 @@ app.post("/api/smm/order", async (req, res) => {
     });
 
     if (!orderResponse.order) {
-      throw new Error("Provider did not return an order ID");
+      throw new Error(
+        orderResponse.error || "Provider failed to process order"
+      );
     }
 
-    const orderId = orderResponse.order;
+    const providerOrderId = orderResponse.order;
+    const ref = `SMM_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const finalServiceName = serviceName || selectedService.name;
 
-    // 4. Deduct Balance & Save Transaction
+    // DESCRIPTIVE PATTERN: [Service Name] - [Quantity] to [Link]
+    const description = `${finalServiceName} (${quantity}) for ${link}`;
+
+    // 4. ATOMIC DATABASE UPDATE (Prevents "lost" transactions)
     const batch = db.batch();
+    const userRef = db.collection("users").doc(userId);
+    const txnRef = userRef.collection("transactions").doc(ref);
 
-    // Deduct
-    batch.update(db.collection("users").doc(userId), {
+    batch.update(userRef, {
       walletBalance: admin.firestore.FieldValue.increment(-userCost),
     });
 
-    // Record Transaction
-    const ref = `SMM_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    batch.set(
-      db.collection("users").doc(userId).collection("transactions").doc(ref),
-      {
-        userId,
-        type: "smm",
-        serviceId,
-        serviceName: serviceName || selectedService.name,
-        category: categoryName || selectedService.category,
-        link,
-        quantity,
-        providerOrderId: orderId,
-        amountCharged: userCost,
-        amountToProvider: providerCost,
-        profit: userCost - providerCost,
-        reference: ref,
-        status: "success", // SMM orders are usually "pending" delivery but "success" submission
-        deliveryStatus: "Pending", // You can track actual delivery status separately
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      }
-    );
+    batch.set(txnRef, {
+      userId,
+      type: "smm",
+      serviceId,
+      serviceName: finalServiceName,
+      category: categoryName || selectedService.category,
+      link,
+      quantity,
+      providerOrderId: providerOrderId,
+      amountCharged: userCost,
+      amountToProvider: providerCost,
+      profit: userCost - providerCost,
+      reference: ref,
+      status: "processing", // Initial status matches provider's "Pending"
+      deliveryStatus: "Pending",
+      description: description, // Correctly recorded now
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
     await batch.commit();
 
     res.json({
       success: true,
       message: "Social Boost Order Placed Successfully!",
-      data: { orderId, cost: userCost },
+      data: { orderId: providerOrderId, cost: userCost, ref },
     });
   } catch (error) {
-    console.error("SMM Order Failed:", error);
+    console.error("SMM Order Error:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2199,24 +2200,31 @@ app.get("/api/smm/orders", async (req, res) => {
 
         orders.forEach((order) => {
           if (order.providerOrderId && statusResponse[order.providerOrderId]) {
-            const newStatus = statusResponse[order.providerOrderId].status;
+            const providerStatus = statusResponse[order.providerOrderId].status; // e.g., "Completed", "Canceled", "In progress"
             const remains = statusResponse[order.providerOrderId].remains;
 
-            // If status changed, update local DB
-            if (newStatus && newStatus !== order.deliveryStatus) {
+            // Map OgaViral status to your internal status
+            let finalStatus = "processing";
+            if (providerStatus === "Completed") finalStatus = "success";
+            if (["Canceled", "Refunded"].includes(providerStatus))
+              finalStatus = "failed";
+
+            if (providerStatus !== order.deliveryStatus) {
               const docRef = db
                 .collection("users")
                 .doc(userId)
                 .collection("transactions")
                 .doc(order.id);
+
               batch.update(docRef, {
-                deliveryStatus: newStatus,
+                status: finalStatus, // This updates the "perpetual processing"
+                deliveryStatus: providerStatus,
                 remains: remains || 0,
                 lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
               });
 
-              // Update the order object in memory to return fresh data immediately
-              order.deliveryStatus = newStatus;
+              order.status = finalStatus;
+              order.deliveryStatus = providerStatus;
               order.remains = remains;
               updatesMade = true;
             }
