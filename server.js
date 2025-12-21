@@ -110,7 +110,7 @@ async function getSafeHavenToken() {
     // 1. Generate fresh assertion automatically
     const assertion = generateClientAssertion();
 
-    // 2. Exchange for Access Token [cite: 1, 3]
+    // 2. Exchange for Access Token
     const response = await fetch(SH_AUTH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -137,7 +137,7 @@ async function getSafeHavenToken() {
     }
 
     shAccessToken = data.access_token;
-    // Store expiry (expires_in is in seconds, usually ~2399s) [cite: 4]
+    // Store expiry (expires_in is in seconds, usually ~2399s)
     shTokenExpiry = now + data.expires_in * 1000;
 
     console.log(
@@ -2384,50 +2384,11 @@ app.post("/api/withdrawal/verify-otp", async (req, res) => {
 //SAFEHAVEN PAYMENT GATEWAY
 
 // ==========================================
-// VIRTUAL ACCOUNT & KYC (REPLACES CHECKOUT)
+// SAFE HAVEN CHECKOUT (FUNDING) ROUTES
 // ==========================================
 
-// 1. Initiate KYC (Send OTP) [cite: 184]
-app.post("/api/virtual-account/initiate-kyc", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  try {
-    await verifyFirebaseToken(idToken);
-    const { bvn } = req.body;
-
-    if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({ error: "Invalid BVN length" });
-    }
-
-    // Call Safe Haven Verify Identity (Type: BVN)
-    const response = await makeSafeHavenRequest("/identity/v2", "POST", {
-      type: "BVN",
-      number: bvn,
-      async: false, // Sync for immediate ID return
-    });
-
-    if (response.data && response.data.data && response.data.data._id) {
-      res.json({
-        success: true,
-        message: "OTP sent to your BVN phone number",
-        identityId: response.data.data._id,
-      });
-    } else {
-      res.status(400).json({
-        error: response.data.message || "Verification failed. Check BVN.",
-      });
-    }
-  } catch (error) {
-    console.error("KYC Init Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 2. Validate OTP & Create Account [cite: 191, 207]
-app.post("/api/virtual-account/create", async (req, res) => {
+// 1. Initialize Payment (Get Config & Reference)
+app.post("/api/funding/initialize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
@@ -2435,85 +2396,122 @@ app.post("/api/virtual-account/create", async (req, res) => {
 
   try {
     const userId = await verifyFirebaseToken(idToken);
-    const { identityId, otp, bvn } = req.body;
+    const { amount } = req.body;
 
-    if (!identityId || !otp || !bvn) {
-      return res.status(400).json({ error: "Missing required fields" });
+    if (!amount || amount < 100) {
+      return res.status(400).json({ error: "Minimum amount is ₦100" });
     }
 
-    // A. Validate OTP
-    const validateRes = await makeSafeHavenRequest(
-      "/identity/v2/validate",
-      "POST",
-      {
-        identityId,
-        type: "BVN",
-        otp,
-      }
-    );
-
-    if (!validateRes.data || !validateRes.data.data) {
-      return res
-        .status(400)
-        .json({ error: "Invalid OTP or Verification failed" });
-    }
-
-    // B. Create Sub Account
+    // Get User Details
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    const accountRes = await makeSafeHavenRequest(
-      "/accounts/v2/subaccount",
-      "POST",
-      {
-        phoneNumber: userData.phoneNumber || "+2348000000000",
-        emailAddress: userData.email,
-        externalReference: userId,
-        identityType: "BVN",
-        identityNumber: bvn,
-        identityId: identityId,
-        otp: otp,
-        autoSweep: true,
-        autoSweepDetails: {
-          schedule: "Instant",
-          accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
+    // Generate unique reference
+    const reference = `FUND-${userId.substring(0, 5)}-${Date.now()}`;
+
+    // Save pending transaction
+    await db
+      .collection("transactions")
+      .doc(reference)
+      .set({
+        userId,
+        reference,
+        type: "funding_attempt", // Temp status
+        amount: parseFloat(amount),
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        gateway: "safehaven_checkout",
+      });
+
+    // Return Config to Frontend
+    res.json({
+      success: true,
+      config: {
+        environment: "production",
+        clientId: process.env.SAFE_HAVEN_CLIENT_ID,
+        referenceCode: reference,
+        amount: parseFloat(amount),
+        currency: "NGN",
+        customer: {
+          firstName: userData.firstName || "Customer",
+          lastName: userData.lastName || "User",
+          emailAddress: userData.email,
+          phoneNumber: userData.phoneNumber || "+2340000000000",
         },
-      }
+        settlementAccount: {
+          bankCode: "090286", // Safe Haven MFB Code
+          accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Your Merchant Account
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Funding Init Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Verify Payment (Called after Checkout closes)
+app.post("/api/funding/verify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const { reference } = req.body;
+
+    // 1. Check if already processed
+    const txnDoc = await db.collection("transactions").doc(reference).get();
+    if (!txnDoc.exists)
+      return res.status(404).json({ error: "Transaction not found" });
+    if (txnDoc.data().status === "success")
+      return res.json({ success: true, message: "Already credited" });
+
+    // 2. Verify with Safe Haven
+    // Note: Using the Verify Endpoint from your uploaded docs
+    const verifyRes = await makeSafeHavenRequest(
+      `/checkout/${reference}/verify`,
+      "GET"
     );
+    const data = verifyRes.data;
 
-    if (accountRes.data && accountRes.data.data) {
-      const accountData = accountRes.data.data;
+    console.log("Safe Haven Verify Response:", JSON.stringify(data));
 
-      // Save to Firestore
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          virtualAccount: {
-            accountNumber: accountData.accountNumber,
-            accountName: accountData.accountName,
-            bankName: "Safe Haven MFB",
-            bankCode: "090286",
-            status: "active",
-            createdAt: new Date().toISOString(),
-          },
-        });
+    // 3. Check Status
+    if (data.statusCode === 200 && data.data?.status === "Paid") {
+      const amountPaid = data.data.amount;
+      const userId = txnDoc.data().userId;
 
-      res.json({
+      // 4. Credit Wallet
+      const batch = db.batch();
+
+      // Update User Balance
+      batch.update(db.collection("users").doc(userId), {
+        walletBalance: admin.firestore.FieldValue.increment(amountPaid),
+      });
+
+      // Update Transaction Status
+      batch.update(txnDoc.ref, {
+        status: "success",
+        type: "credit", // Change type to valid credit
+        description: "Wallet Funding (Checkout)",
+        amount: amountPaid,
+        safeHavenId: data.data._id,
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
+
+      return res.json({
         success: true,
-        message: "Account created successfully",
-        account: {
-          accountNumber: accountData.accountNumber,
-          accountName: accountData.accountName,
-        },
+        message: "Wallet credited successfully",
       });
     } else {
-      res.status(400).json({
-        error: accountRes.data.message || "Failed to create account",
-      });
+      return res
+        .status(400)
+        .json({ error: "Payment not successful or pending" });
     }
   } catch (error) {
-    console.error("Account Create Error:", error);
+    console.error("Verification Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2645,7 +2643,7 @@ app.post("/api/withdrawal/process", async (req, res) => {
 
     await batch.commit();
 
-    [cite_start]; // 4. Initiate Transfer [cite: 169]
+    // 4. Initiate Transfer
     const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
     const transferPayload = {
       nameEnquiryReference: sessionId,
@@ -2745,7 +2743,7 @@ const handleWebhook = async (req, res) => {
   console.log("SH Webhook:", JSON.stringify(payload));
 
   try {
-    // === A. FUNDING (Virtual Account Credit) [cite: 204] ===
+    // === A. FUNDING (Virtual Account Credit)  ===
     if (payload.type === "virtualAccount.transfer") {
       const data = payload.data;
       const ref = data.paymentReference;
@@ -2803,7 +2801,7 @@ const handleWebhook = async (req, res) => {
       }
     }
 
-    // === B. WITHDRAWALS (Outwards) [cite: 169] ===
+    // === B. WITHDRAWALS (Outwards)  ===
     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
       const data = payload.data;
       const ref = data.paymentReference;
