@@ -2200,31 +2200,24 @@ app.get("/api/smm/orders", async (req, res) => {
 
         orders.forEach((order) => {
           if (order.providerOrderId && statusResponse[order.providerOrderId]) {
-            const providerStatus = statusResponse[order.providerOrderId].status; // e.g., "Completed", "Canceled", "In progress"
+            const newStatus = statusResponse[order.providerOrderId].status;
             const remains = statusResponse[order.providerOrderId].remains;
 
-            // Map OgaViral status to your internal status
-            let finalStatus = "processing";
-            if (providerStatus === "Completed") finalStatus = "success";
-            if (["Canceled", "Refunded"].includes(providerStatus))
-              finalStatus = "failed";
-
-            if (providerStatus !== order.deliveryStatus) {
+            // If status changed, update local DB
+            if (newStatus && newStatus !== order.deliveryStatus) {
               const docRef = db
                 .collection("users")
                 .doc(userId)
                 .collection("transactions")
                 .doc(order.id);
-
               batch.update(docRef, {
-                status: finalStatus, // This updates the "perpetual processing"
-                deliveryStatus: providerStatus,
+                deliveryStatus: newStatus,
                 remains: remains || 0,
                 lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
               });
 
-              order.status = finalStatus;
-              order.deliveryStatus = providerStatus;
+              // Update the order object in memory to return fresh data immediately
+              order.deliveryStatus = newStatus;
               order.remains = remains;
               updatesMade = true;
             }
