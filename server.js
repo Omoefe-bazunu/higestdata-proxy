@@ -248,6 +248,19 @@ async function verifyFirebaseToken(idToken) {
   }
 }
 
+// === HELPER: SAFEHAVEN REQUERY WITHDRAWAL STATUS ===
+async function checkSafeHavenTransferStatus(sessionId) {
+  try {
+    const { data } = await makeSafeHavenRequest("/transfers/status", "POST", {
+      sessionId,
+    });
+    return data;
+  } catch (error) {
+    console.error("Requery Error:", error.message);
+    return null;
+  }
+}
+
 // === HELPER: SAFE HAVEN REQUEST ===
 async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
   try {
@@ -2368,16 +2381,14 @@ app.post("/api/withdrawal/verify-otp", async (req, res) => {
   }
 });
 
-//SAFEHAVEN
-
-//FUNDING
+//SAFEHAVEN PAYMENT GATEWAY
 
 // ==========================================
-// SAFE HAVEN CHECKOUT (FUNDING) ROUTES
+// VIRTUAL ACCOUNT & KYC
 // ==========================================
 
-// 1. Initialize Payment (Get Config & Reference)
-app.post("/api/funding/initialize", async (req, res) => {
+// 1. Initiate KYC (Send OTP to BVN Phone)
+app.post("/api/virtual-account/initiate-kyc", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
@@ -2385,122 +2396,127 @@ app.post("/api/funding/initialize", async (req, res) => {
 
   try {
     const userId = await verifyFirebaseToken(idToken);
-    const { amount } = req.body;
+    const { bvn } = req.body;
 
-    if (!amount || amount < 100) {
-      return res.status(400).json({ error: "Minimum amount is ₦100" });
+    if (!bvn || bvn.length !== 11) {
+      return res.status(400).json({ error: "Invalid BVN length" });
     }
 
-    // Get User Details
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
-    // Generate unique reference
-    const reference = `FUND-${userId.substring(0, 5)}-${Date.now()}`;
-
-    // Save pending transaction
-    await db
-      .collection("transactions")
-      .doc(reference)
-      .set({
-        userId,
-        reference,
-        type: "funding_attempt", // Temp status
-        amount: parseFloat(amount),
-        status: "pending",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        gateway: "safehaven_checkout",
-      });
-
-    // Return Config to Frontend
-    res.json({
-      success: true,
-      config: {
-        environment: "production",
-        clientId: process.env.SAFE_HAVEN_CLIENT_ID,
-        referenceCode: reference,
-        amount: parseFloat(amount),
-        currency: "NGN",
-        customer: {
-          firstName: userData.firstName || "Customer",
-          lastName: userData.lastName || "User",
-          emailAddress: userData.email,
-          phoneNumber: userData.phoneNumber || "+2340000000000",
-        },
-        settlementAccount: {
-          bankCode: "090286", // Safe Haven MFB Code
-          accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Your Merchant Account
-        },
-      },
+    // Call Safe Haven Verify Identity (Type: BVN)
+    // [cite: 789]
+    const response = await makeSafeHavenRequest("/identity/v2", "POST", {
+      type: "BVN",
+      number: bvn,
+      async: false, // We want immediate response to get the identityId
     });
+
+    if (response.data && response.data.data && response.data.data._id) {
+      // Return the Identity ID to frontend (needed for validation)
+      res.json({
+        success: true,
+        message: "OTP sent to your BVN phone number",
+        identityId: response.data.data._id,
+      });
+    } else {
+      res.status(400).json({
+        error: response.data.message || "Verification failed. Check BVN.",
+      });
+    }
   } catch (error) {
-    console.error("Funding Init Error:", error);
+    console.error("KYC Init Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// 2. Verify Payment (Called after Checkout closes)
-app.post("/api/funding/verify", async (req, res) => {
+// 2. Validate OTP & Create Static Account
+app.post("/api/virtual-account/create", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
 
   try {
-    const { reference } = req.body;
+    const userId = await verifyFirebaseToken(idToken);
+    const { identityId, otp, bvn } = req.body;
 
-    // 1. Check if already processed
-    const txnDoc = await db.collection("transactions").doc(reference).get();
-    if (!txnDoc.exists)
-      return res.status(404).json({ error: "Transaction not found" });
-    if (txnDoc.data().status === "success")
-      return res.json({ success: true, message: "Already credited" });
+    if (!identityId || !otp || !bvn) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
 
-    // 2. Verify with Safe Haven
-    // Note: Using the Verify Endpoint from your uploaded docs
-    const verifyRes = await makeSafeHavenRequest(
-      `/checkout/${reference}/verify`,
-      "GET"
+    // 1. Validate Verification [cite: 812]
+    const validateRes = await makeSafeHavenRequest(
+      "/identity/v2/validate",
+      "POST",
+      {
+        identityId,
+        type: "BVN",
+        otp,
+      }
     );
-    const data = verifyRes.data;
 
-    console.log("Safe Haven Verify Response:", JSON.stringify(data));
-
-    // 3. Check Status
-    if (data.statusCode === 200 && data.data?.status === "Paid") {
-      const amountPaid = data.data.amount;
-      const userId = txnDoc.data().userId;
-
-      // 4. Credit Wallet
-      const batch = db.batch();
-
-      // Update User Balance
-      batch.update(db.collection("users").doc(userId), {
-        walletBalance: admin.firestore.FieldValue.increment(amountPaid),
-      });
-
-      // Update Transaction Status
-      batch.update(txnDoc.ref, {
-        status: "success",
-        type: "credit", // Change type to valid credit
-        description: "Wallet Funding (Checkout)",
-        amount: amountPaid,
-        safeHavenId: data.data._id,
-        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      await batch.commit();
-
-      return res.json({
-        success: true,
-        message: "Wallet credited successfully",
-      });
-    } else {
+    if (!validateRes.data || !validateRes.data.data) {
       return res
         .status(400)
-        .json({ error: "Payment not successful or pending" });
+        .json({ error: "Invalid OTP or Verification failed" });
+    }
+
+    // 2. Fetch User Data for Account Creation
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // 3. Create Sub Account [cite: 796]
+    const accountRes = await makeSafeHavenRequest(
+      "/accounts/v2/subaccount",
+      "POST",
+      {
+        phoneNumber: userData.phoneNumber || "+2348000000000", // Format: +234...
+        emailAddress: userData.email,
+        externalReference: userId, // Link to Firebase User ID
+        identityType: "BVN",
+        identityNumber: bvn,
+        identityId: identityId,
+        otp: otp,
+        autoSweep: true, // Auto sweep to main account (optional)
+        autoSweepDetails: {
+          schedule: "Instant",
+          accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
+        },
+      }
+    );
+
+    if (accountRes.data && accountRes.data.data) {
+      const accountData = accountRes.data.data;
+
+      // Save Virtual Account to User Profile in Firestore
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          virtualAccount: {
+            accountNumber: accountData.accountNumber,
+            accountName: accountData.accountName,
+            bankName: "Safe Haven MFB",
+            bankCode: "090286",
+            status: "active",
+            createdAt: new Date().toISOString(),
+          },
+        });
+
+      res.json({
+        success: true,
+        message: "Account created successfully",
+        account: {
+          accountNumber: accountData.accountNumber,
+          accountName: accountData.accountName,
+        },
+      });
+    } else {
+      res.status(400).json({
+        error: accountRes.data.message || "Failed to create account",
+      });
     }
   } catch (error) {
-    console.error("Verification Error:", error);
+    console.error("Account Create Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2693,28 +2709,199 @@ app.post("/api/withdrawal/process", async (req, res) => {
   }
 });
 
+// === MANUAL WITHDRAWAL STATUS CHECK (Fixes stuck 'Processing') ===
+app.post("/api/withdrawal/reverify", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+
+  // Optionally: Add Admin Check here
+
+  const { reference } = req.body;
+  if (!reference) return res.status(400).json({ error: "Reference required" });
+
+  try {
+    const reqDoc = await db
+      .collection("withdrawalRequests")
+      .doc(reference)
+      .get();
+    if (!reqDoc.exists)
+      return res.status(404).json({ error: "Transaction not found" });
+
+    const docData = reqDoc.data();
+
+    // Only check if currently processing
+    if (docData.status !== "processing" && docData.status !== "manual_review") {
+      return res.json({
+        success: true,
+        message: `Transaction is already ${docData.status}`,
+      });
+    }
+
+    // We need the Provider Session ID (saved during process step)
+    const sessionId = docData.providerRef;
+    if (!sessionId) {
+      return res
+        .status(400)
+        .json({ error: "No Provider Session ID found. Cannot requery." });
+    }
+
+    // Call Safe Haven Status [cite: 780]
+    const statusData = await checkSafeHavenTransferStatus(sessionId);
+
+    if (statusData && statusData.data) {
+      const shStatus = statusData.data.status; // "Completed", "Failed"
+      const userId = docData.userId;
+
+      if (shStatus === "Completed" || shStatus === "Successful") {
+        const batch = db.batch();
+        batch.update(reqDoc.ref, {
+          status: "success",
+          verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        batch.update(
+          db
+            .collection("users")
+            .doc(userId)
+            .collection("transactions")
+            .doc(reference),
+          { status: "success" }
+        );
+        await batch.commit();
+        return res.json({
+          success: true,
+          status: "success",
+          message: "Transaction updated to Success",
+        });
+      } else if (shStatus === "Failed" || shStatus === "Reversed") {
+        const batch = db.batch();
+        batch.update(db.collection("users").doc(userId), {
+          walletBalance: admin.firestore.FieldValue.increment(
+            docData.totalDeduct
+          ),
+        });
+        batch.update(reqDoc.ref, {
+          status: "failed",
+          reason: "Requery: Failed",
+        });
+        batch.update(
+          db
+            .collection("users")
+            .doc(userId)
+            .collection("transactions")
+            .doc(reference),
+          { status: "failed" }
+        );
+        await batch.commit();
+        return res.json({
+          success: true,
+          status: "failed",
+          message: "Transaction updated to Failed (Refunded)",
+        });
+      }
+
+      return res.json({
+        success: true,
+        status: "processing",
+        message: "Transaction still processing at bank.",
+      });
+    }
+
+    res.json({
+      success: false,
+      message: "Could not fetch status from Safe Haven",
+    });
+  } catch (error) {
+    console.error("Reverify Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
-// WEBHOOK HANDLER (Withdrawals Only)
+// UNIFIED WEBHOOK HANDLER
 // ==========================================
 app.post("/webhooks", async (req, res) => {
-  // 1. Acknowledge IMMEDIATELY to stop retries
+  // Acknowledge immediately
   res.sendStatus(200);
 
   const payload = req.body;
-
-  // Optional: Log only relevant events to keep logs clean
-  if (payload.type === "transfer" || payload.eventType === "account.debit") {
-    console.log("Webhook Received:", JSON.stringify(payload));
-  }
+  console.log("SH Webhook:", JSON.stringify(payload));
 
   try {
-    const data = payload.data;
-    if (!data) return;
+    // === 1. HANDLING WALLET FUNDING (Virtual Account Credit) ===
+    // [cite: 808] Type: "virtualAccount.transfer"
+    if (payload.type === "virtualAccount.transfer") {
+      const data = payload.data;
+      const ref = data.paymentReference;
+      const creditAmount = data.amount;
+      const accountNumber = data.creditAccountNumber; // The virtual account number
 
-    // We only care about OUTWARDS transfers (Withdrawals)
-    if (data.type === "Outwards") {
+      // Check if already processed
+      const existingTxn = await db.collection("transactions").doc(ref).get();
+      if (existingTxn.exists) {
+        console.log(`Funding ${ref} already processed.`);
+        return;
+      }
+
+      // Find user by Virtual Account Number
+      const userQuery = await db
+        .collection("users")
+        .where("virtualAccount.accountNumber", "==", accountNumber)
+        .limit(1)
+        .get();
+
+      if (!userQuery.empty) {
+        const userDoc = userQuery.docs[0];
+        const userId = userDoc.id;
+
+        const batch = db.batch();
+
+        // Credit Wallet
+        batch.update(userDoc.ref, {
+          walletBalance: admin.firestore.FieldValue.increment(creditAmount),
+        });
+
+        // Record Transaction
+        batch.set(
+          db
+            .collection("users")
+            .doc(userId)
+            .collection("transactions")
+            .doc(ref),
+          {
+            userId,
+            type: "funding", // Funding
+            amount: creditAmount,
+            reference: ref,
+            status: "success",
+            description: `Wallet Deposit (Bank Transfer)`,
+            source: data.debitAccountName || "Bank Transfer",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            webhookData: data,
+          }
+        );
+
+        // Also save to global transactions to prevent duplicates
+        batch.set(db.collection("transactions").doc(ref), {
+          processed: true,
+          type: "funding",
+        });
+
+        await batch.commit();
+        console.log(`Funded User ${userId} with ₦${creditAmount}`);
+      } else {
+        console.error(`No user found for Virtual Account: ${accountNumber}`);
+      }
+    }
+
+    // === 2. HANDLING WITHDRAWALS (Outwards Transfer) ===
+    //  Type: "transfer", Data Type: "Outwards"
+    else if (payload.type === "transfer" && payload.data.type === "Outwards") {
+      const data = payload.data;
       const ref = data.paymentReference;
       const status = data.status; // "Completed", "Successful", "Failed"
+
+      console.log(`Withdrawal Webhook: Ref ${ref}, Status ${status}`);
 
       const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
 
@@ -2722,42 +2909,42 @@ app.post("/webhooks", async (req, res) => {
         const docData = reqDoc.data();
         const userId = docData.userId;
 
-        // Only update if the status is still pending/processing
+        // Only update if still processing
         if (
           docData.status === "processing" ||
           docData.status === "manual_review"
         ) {
           if (status === "Completed" || status === "Successful") {
-            // SUCCESS: Mark DB as success
             const batch = db.batch();
+            // Update Request
             batch.update(reqDoc.ref, {
               status: "success",
               completedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
+            // Update User Transaction
             batch.update(
               db
                 .collection("users")
                 .doc(userId)
                 .collection("transactions")
                 .doc(ref),
-              {
-                status: "success",
-              }
+              { status: "success" }
             );
             await batch.commit();
-            console.log(`Withdrawal ${ref} SUCCESS.`);
+            console.log(`Withdrawal ${ref} marked SUCCESS.`);
           } else if (status === "Failed" || status === "Reversed") {
-            // FAILURE: Refund the user
             const batch = db.batch();
+            // Refund User
             batch.update(db.collection("users").doc(userId), {
               walletBalance: admin.firestore.FieldValue.increment(
                 docData.totalDeduct
               ),
             });
+            // Mark Failed
             batch.update(reqDoc.ref, {
               status: "failed",
               failedAt: admin.firestore.FieldValue.serverTimestamp(),
-              reason: "Webhook Failed",
+              reason: data.responseMessage || "Transfer Failed",
             });
             batch.update(
               db
@@ -2765,20 +2952,16 @@ app.post("/webhooks", async (req, res) => {
                 .doc(userId)
                 .collection("transactions")
                 .doc(ref),
-              {
-                status: "failed",
-              }
+              { status: "failed" }
             );
             await batch.commit();
-            console.log(`Withdrawal ${ref} FAILED. User Refunded.`);
+            console.log(`Withdrawal ${ref} FAILED. Refunded.`);
           }
         }
       } else {
-        // This might happen if you trigger a transfer manually from the SH Dashboard
-        console.log(`Ignored Outwards Transfer ${ref} (Not found in DB)`);
+        console.log(`Withdrawal Ref ${ref} not found in DB.`);
       }
     }
-    // "Inwards" (Funding) is now completely ignored.
   } catch (err) {
     console.error("Webhook Logic Error:", err);
   }
