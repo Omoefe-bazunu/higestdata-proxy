@@ -2459,15 +2459,16 @@ app.post("/api/funding/verify", async (req, res) => {
   try {
     const { reference } = req.body;
 
-    // 1. Check if already processed
+    // 1. Check if already processed (Global Collection)
     const txnDoc = await db.collection("transactions").doc(reference).get();
     if (!txnDoc.exists)
       return res.status(404).json({ error: "Transaction not found" });
+
+    // Idempotency check: If already success, just return success
     if (txnDoc.data().status === "success")
       return res.json({ success: true, message: "Already credited" });
 
     // 2. Verify with Safe Haven
-    // Note: Using the Verify Endpoint from your uploaded docs
     const verifyRes = await makeSafeHavenRequest(
       `/checkout/${reference}/verify`,
       "GET"
@@ -2481,22 +2482,40 @@ app.post("/api/funding/verify", async (req, res) => {
       const amountPaid = data.data.amount;
       const userId = txnDoc.data().userId;
 
-      // 4. Credit Wallet
       const batch = db.batch();
 
-      // Update User Balance
+      // A. Credit Wallet Balance
       batch.update(db.collection("users").doc(userId), {
         walletBalance: admin.firestore.FieldValue.increment(amountPaid),
       });
 
-      // Update Transaction Status
+      // B. Update Global Transaction (Admin View)
       batch.update(txnDoc.ref, {
         status: "success",
-        type: "credit", // Change type to valid credit
+        type: "credit",
         description: "Wallet Funding (Checkout)",
         amount: amountPaid,
         safeHavenId: data.data._id,
         verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // C. CREATE USER TRANSACTION RECORD (The Missing Piece)
+      // This ensures the transaction shows up in the user's history list
+      const userTxnRef = db
+        .collection("users")
+        .doc(userId)
+        .collection("transactions")
+        .doc(reference);
+
+      batch.set(userTxnRef, {
+        userId,
+        reference,
+        type: "funding", // Consistent with your other funding types
+        amount: amountPaid,
+        status: "success",
+        description: "Wallet Deposit (Checkout)",
+        source: "Safe Haven Checkout",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
       await batch.commit();
