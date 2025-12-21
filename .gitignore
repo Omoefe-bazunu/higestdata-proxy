@@ -2,3 +2,4 @@
 node_modules/
 serviceAccountKey.json
 ServiceAccountKey.json
+privatekey.pem
