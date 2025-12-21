@@ -2012,6 +2012,8 @@ app.get("/api/smm/services", async (req, res) => {
   }
 });
 
+//
+
 // --- Endpoint: Place SMM Order ---
 app.post("/api/smm/order", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -2804,7 +2806,7 @@ app.get("/webhook/test", (req, res) => {
 // === START SERVER ===
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend running on port ${PORT}`);
-  console.log(`Live at: https://higestdata-proxy.onrender.com`);
+  console.log(`Live at: https://higestdata-proxy.onrender.comm`);
   console.log(
     `Kora Webhook: https://higestdata-proxy.onrender.com/webhook/kora`
   );
