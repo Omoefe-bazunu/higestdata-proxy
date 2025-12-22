@@ -546,13 +546,31 @@ app.post("/api/data/purchase", async (req, res) => {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
+    // Ebills only accepts: mtn, airtel, glo, 9mobile, smile
+    let networkId = service.toLowerCase();
+    if (networkId.includes("mtn")) networkId = "mtn";
+    else if (networkId.includes("airtel")) networkId = "airtel";
+    else if (networkId.includes("glo")) networkId = "glo";
+    else if (networkId.includes("9mobile") || networkId.includes("etisalat"))
+      networkId = "9mobile";
+    else if (networkId.includes("smile")) networkId = "smile";
+    // === FIX END ===
+
     // Call Ebills
     const ebillsResponse = await makeEbillsRequest("/data", "POST", {
       request_id: ref,
       phone: MobileNumber,
-      service_id: service.toLowerCase(),
+      service_id: networkId, // Updated to use sanitized ID
       variation_id: DataPlan, // Ebills expects variation_id
     });
+
+    // // Call Ebills
+    // const ebillsResponse = await makeEbillsRequest("/data", "POST", {
+    //   request_id: ref,
+    //   phone: MobileNumber,
+    //   service_id: service.toLowerCase(),
+    //   variation_id: DataPlan, // Ebills expects variation_id
+    // });
 
     if (ebillsResponse.code === "success") {
       const batch = db.batch();
