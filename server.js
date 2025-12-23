@@ -296,19 +296,42 @@ async function checkSafeHavenTransferStatus(sessionId) {
 // }
 
 // === HELPER: SAFE HAVEN REQUEST ===
-async function makeSafeHavenRequest(path, method, body) {
-  const token = process.env.SAFE_HAVEN_ACCESS_TOKEN;
-  const response = await fetch(`https://api.safehavenmfb.com${path}`, {
-    method,
-    headers: {
+async function makeSafeHavenRequest(
+  endpoint,
+  method = "GET",
+  body = null,
+  extraHeaders = {}
+) {
+  try {
+    const token = await getSafeHavenToken();
+    const headers = {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
-      ClientID: "8503fea8f2fe28691af4edbcf715d53f", // From your logs
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json();
-  return { status: response.status, data };
+      ...extraHeaders, // Allow extra headers
+    };
+
+    const config = { method, headers };
+    if (body) config.body = JSON.stringify(body);
+
+    console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
+    console.log(`SH Headers:`, headers);
+    if (body) console.log(`SH Body:`, body);
+
+    const res = await fetch(`${SH_API_URL}${endpoint}`, config);
+    const data = await res.json();
+
+    if (!res.ok) {
+      console.error(
+        `SH API Error (${res.status}):`,
+        JSON.stringify(data, null, 2)
+      );
+    }
+
+    return { status: res.status, data };
+  } catch (error) {
+    console.error("makeSafeHavenRequest Error:", error);
+    return { status: 500, data: { message: error.message } };
+  }
 }
 
 // --- Helper: Make OgaViral Request ---
@@ -2780,94 +2803,6 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
     // ... logic to update DB based on statusData ... (Same as webhook logic)
 
     res.json({ success: true, status: statusData?.data?.status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === GET USER VIRTUAL ACCOUNT ===
-app.get("/api/virtual-account", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  try {
-    const userId = await verifyFirebaseToken(idToken);
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
-    if (userData?.virtualAccount) {
-      return res.json({ success: true, data: userData.virtualAccount });
-    }
-    res.json({ success: false, message: "No virtual account found" });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// === VIRTUAL ACCOUNT: STEP 1 - INITIATE BVN VERIFICATION ===
-// 1. Initiate BVN Verification
-app.post("/api/virtual-account/initiate", async (req, res) => {
-  try {
-    const { bvn } = req.body;
-    const { status, data } = await makeSafeHavenRequest(
-      "/identity/v2",
-      "POST",
-      {
-        type: "BVN",
-        number: bvn,
-        debitAccountNumber: "0118622228", // From your logs
-        async: false,
-      }
-    );
-
-    if (status === 200 && data.data?._id) {
-      return res.json({ success: true, identityId: data.data._id });
-    }
-    res.status(status).json({ error: data.message || "Safe Haven error" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 2. Validate OTP & Create Account
-app.post("/api/virtual-account/create", async (req, res) => {
-  try {
-    const { otp, identityId, bvn, email, phone } = req.body;
-
-    // A. Validate
-    const val = await makeSafeHavenRequest("/identity/v2/validate", "POST", {
-      identityId,
-      type: "BVN",
-      otp,
-    });
-
-    if (val.status !== 200)
-      return res.status(400).json({ error: "Invalid OTP" });
-
-    // B. Create
-    const create = await makeSafeHavenRequest(
-      "/accounts/v2/subaccount",
-      "POST",
-      {
-        phoneNumber: phone || "+2348000000000",
-        emailAddress: email,
-        externalReference: `VA_${Date.now()}`,
-        identityType: "BVN",
-        identityNumber: bvn,
-        identityId: identityId,
-        otp: otp,
-        callbackUrl: "https://higestdata-proxy.onrender.com/webhook",
-        autoSweep: false,
-      }
-    );
-
-    if (create.status === 200) {
-      // Logic to save to your Firestore 'users' collection goes here
-      return res.json({ success: true, data: create.data.data });
-    }
-    res.status(create.status).json({ error: create.data.message });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
