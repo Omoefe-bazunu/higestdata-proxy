@@ -2770,6 +2770,152 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 });
 
 // ==========================================
+// STATIC VIRTUAL ACCOUNT ROUTES
+// ==========================================
+
+// GET USER'S VIRTUAL ACCOUNT
+app.get("/api/virtual-account", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    if (userData.virtualAccount) {
+      res.json({
+        success: true,
+        data: userData.virtualAccount,
+      });
+    } else {
+      res.json({
+        success: false,
+        message: "No virtual account found",
+      });
+    }
+  } catch (error) {
+    console.error("Get VA error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CREATE VIRTUAL ACCOUNT (STATIC SUB-ACCOUNT)
+app.post("/api/virtual-account/create", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  let userId;
+  try {
+    userId = await verifyFirebaseToken(idToken);
+  } catch (err) {
+    return res.status(401).json({ error: err.message });
+  }
+
+  const { bvn, phoneNumber, emailAddress } = req.body;
+
+  if (!bvn || !phoneNumber || !emailAddress) {
+    return res
+      .status(400)
+      .json({ error: "Missing required fields: BVN, phone, email" });
+  }
+
+  try {
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+
+    if (userData.virtualAccount) {
+      return res.status(400).json({ error: "Virtual account already exists" });
+    }
+
+    // 1. Initiate Identity Verification
+    const verifyPayload = {
+      type: "BVN",
+      number: bvn,
+      debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Debit verification fee from merchant account
+      provider: "creditRegistry",
+    };
+
+    const verifyRes = await makeSafeHavenRequest(
+      "/identity/v2",
+      "POST",
+      verifyPayload
+    );
+
+    if (verifyRes.status !== 200 || verifyRes.data.data.status !== "SUCCESS") {
+      console.error("Verification failed:", verifyRes.data);
+      return res
+        .status(400)
+        .json({
+          error: verifyRes.data.message || "Identity verification failed",
+        });
+    }
+
+    const identityId = verifyRes.data.data._id;
+
+    // 2. Create Sub-Account (Static VA)
+    const createPayload = {
+      phoneNumber: `+234${phoneNumber.slice(1)}`, // Format to +234...
+      emailAddress,
+      externalReference: `user_va_${userId}`,
+      identityType: "BVN",
+      identityNumber: bvn,
+      identityId,
+      autoSweep: false, // No auto-sweep, funds stay for webhook to credit wallet
+      callbackUrl: "https://higestdata-proxy.onrender.com/webhook", // Your webhook URL (register in dashboard too)
+    };
+
+    const createRes = await makeSafeHavenRequest(
+      "/accounts/v2/subaccount",
+      "POST",
+      createPayload
+    );
+
+    if (createRes.status !== 200 || !createRes.data.data.accountNumber) {
+      console.error("Create VA failed:", createRes.data);
+      return res
+        .status(400)
+        .json({
+          error: createRes.data.message || "Failed to create virtual account",
+        });
+    }
+
+    const vaData = createRes.data.data;
+
+    // 3. Save to User Doc (Production: Use batch for atomicity)
+    await userRef.update({
+      virtualAccount: {
+        accountNumber: vaData.accountNumber,
+        accountName: vaData.accountName,
+        bankCode: "090286", // Safe Haven MFB code
+        bankName: "Safe Haven MFB",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    });
+
+    res.json({
+      success: true,
+      message: "Virtual account created successfully",
+      data: vaData,
+    });
+  } catch (error) {
+    console.error("Create VA error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ==========================================
 // UNIFIED WEBHOOK HANDLER
 // ==========================================
 const handleWebhook = async (req, res) => {
