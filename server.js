@@ -2828,7 +2828,7 @@ app.get("/api/virtual-account", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
+// INITIATE VERIFICATION (Step 1) - Corrected with mandatory ClientID header
 app.post("/api/virtual-account/initiate-verification", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2841,7 +2841,7 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
 
     if (!bvn) return res.status(400).json({ error: "BVN is required" });
 
-    // 1. Call Safe Haven Identity V2 to trigger OTP [cite: 545]
+    // Step 1: Call Safe Haven Identity V2
     const verifyPayload = {
       type: "BVN",
       number: bvn,
@@ -2850,30 +2850,33 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
       async: true,
     };
 
+    // CRITICAL: Identity API requires the ClientID header [cite: 564]
     const verifyRes = await makeSafeHavenRequest(
       "/identity/v2",
       "POST",
-      verifyPayload
+      verifyPayload,
+      { ClientID: process.env.SAFE_HAVEN_CLIENT_ID }
     );
 
     if (verifyRes.status === 200 && verifyRes.data.data) {
-      // Return the _id (identityId) to the frontend for the next step [cite: 546]
       return res.json({
         success: true,
         data: { identityId: verifyRes.data.data._id },
       });
     } else {
+      console.error("SH Identity Error:", verifyRes.data);
       return res.status(400).json({
         error:
           verifyRes.data.message || "Identity verification initiation failed",
       });
     }
   } catch (error) {
-    console.error("Verification Init Error:", error);
+    console.error("Verification Init Critical Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// CREATE VIRTUAL ACCOUNT (Step 2 & 3) - Corrected with mandatory ClientID header
 app.post("/api/virtual-account/create", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2884,15 +2887,12 @@ app.post("/api/virtual-account/create", async (req, res) => {
     const userId = await verifyFirebaseToken(idToken);
     const { bvn, phoneNumber, emailAddress, otp, identityId } = req.body;
 
-    // 1. Validate the OTP first [cite: 568]
+    // 1. Validate OTP [cite: 568]
     const validateRes = await makeSafeHavenRequest(
       "/identity/v2/validate",
       "POST",
-      {
-        identityId,
-        type: "BVN",
-        otp,
-      }
+      { identityId, type: "BVN", otp },
+      { ClientID: process.env.SAFE_HAVEN_CLIENT_ID }
     );
 
     if (validateRes.status !== 200 || !validateRes.data.data?.otpVerified) {
@@ -2923,15 +2923,12 @@ app.post("/api/virtual-account/create", async (req, res) => {
       "/accounts/v2/subaccount",
       "POST",
       createPayload,
-      {
-        ClientID: process.env.SAFE_HAVEN_CLIENT_ID, // Required Metadata header [cite: 564]
-      }
+      { ClientID: process.env.SAFE_HAVEN_CLIENT_ID }
     );
 
     if (createRes.status === 200 && createRes.data.data?.accountNumber) {
       const vaData = createRes.data.data;
 
-      // Update User in Firestore
       await db
         .collection("users")
         .doc(userId)
