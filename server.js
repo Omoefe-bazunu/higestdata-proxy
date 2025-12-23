@@ -262,24 +262,64 @@ async function checkSafeHavenTransferStatus(sessionId) {
 }
 
 // === HELPER: SAFE HAVEN REQUEST ===
-async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
+// async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
+//   try {
+//     const token = await getSafeHavenToken();
+//     const headers = {
+//       Authorization: `Bearer ${token}`,
+//       "Content-Type": "application/json",
+//       ClientID: SH_CLIENT_ID,
+//     };
+
+//     const config = { method, headers };
+//     if (body) config.body = JSON.stringify(body);
+
+//     console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
+
+//     const res = await fetch(`${SH_API_URL}${endpoint}`, config);
+//     const data = await res.json();
+
+//     // Log errors for debugging
+//     if (!res.ok) {
+//       console.error(
+//         `SH API Error (${res.status}):`,
+//         JSON.stringify(data, null, 2)
+//       );
+//     }
+
+//     return { status: res.status, data };
+//   } catch (error) {
+//     console.error("makeSafeHavenRequest Error:", error);
+//     // Return a structured error so the route handler doesn't crash
+//     return { status: 500, data: { message: error.message } };
+//   }
+// }
+
+// === HELPER: SAFE HAVEN REQUEST ===
+async function makeSafeHavenRequest(
+  endpoint,
+  method = "GET",
+  body = null,
+  extraHeaders = {}
+) {
   try {
     const token = await getSafeHavenToken();
     const headers = {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
-      ClientID: SH_CLIENT_ID,
+      ...extraHeaders, // Allow extra headers
     };
 
     const config = { method, headers };
     if (body) config.body = JSON.stringify(body);
 
     console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
+    console.log(`SH Headers:`, headers);
+    if (body) console.log(`SH Body:`, body);
 
     const res = await fetch(`${SH_API_URL}${endpoint}`, config);
     const data = await res.json();
 
-    // Log errors for debugging
     if (!res.ok) {
       console.error(
         `SH API Error (${res.status}):`,
@@ -290,7 +330,6 @@ async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
     return { status: res.status, data };
   } catch (error) {
     console.error("makeSafeHavenRequest Error:", error);
-    // Return a structured error so the route handler doesn't crash
     return { status: 500, data: { message: error.message } };
   }
 }
@@ -2769,46 +2808,7 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
   }
 });
 
-// ==========================================
-// STATIC VIRTUAL ACCOUNT ROUTES
-// ==========================================
-
-// GET USER'S VIRTUAL ACCOUNT
-app.get("/api/virtual-account", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  let userId;
-  try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-
-  try {
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
-    if (userData.virtualAccount) {
-      res.json({
-        success: true,
-        data: userData.virtualAccount,
-      });
-    } else {
-      res.json({
-        success: false,
-        message: "No virtual account found",
-      });
-    }
-  } catch (error) {
-    console.error("Get VA error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// CREATE VIRTUAL ACCOUNT (STATIC SUB-ACCOUNT)
+// CREATE VIRTUAL ACCOUNT (STATIC SUB-ACCOUNT) - FIXED VERSION
 app.post("/api/virtual-account/create", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2822,12 +2822,17 @@ app.post("/api/virtual-account/create", async (req, res) => {
     return res.status(401).json({ error: err.message });
   }
 
-  const { bvn, phoneNumber, emailAddress } = req.body;
+  const { bvn, phoneNumber, emailAddress, otp } = req.body; // ADDED otp parameter
 
   if (!bvn || !phoneNumber || !emailAddress) {
     return res
       .status(400)
       .json({ error: "Missing required fields: BVN, phone, email" });
+  }
+
+  // ADDED: OTP is required for BVN verification
+  if (!otp) {
+    return res.status(400).json({ error: "OTP is required for verification" });
   }
 
   try {
@@ -2839,12 +2844,16 @@ app.post("/api/virtual-account/create", async (req, res) => {
       return res.status(400).json({ error: "Virtual account already exists" });
     }
 
-    // 1. Initiate Identity Verification
+    // ============================================
+    // STEP 1: INITIATE IDENTITY VERIFICATION
+    // ============================================
+    console.log("Step 1: Initiating BVN verification...");
     const verifyPayload = {
       type: "BVN",
       number: bvn,
-      debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Debit verification fee from merchant account
+      debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
       provider: "creditRegistry",
+      async: true, // Usually set to true for async verification
     };
 
     const verifyRes = await makeSafeHavenRequest(
@@ -2853,65 +2862,150 @@ app.post("/api/virtual-account/create", async (req, res) => {
       verifyPayload
     );
 
-    if (verifyRes.status !== 200 || verifyRes.data.data.status !== "SUCCESS") {
-      console.error("Verification failed:", verifyRes.data);
-      return res
-        .status(400)
-        .json({
-          error: verifyRes.data.message || "Identity verification failed",
-        });
+    console.log(
+      "Verification Response:",
+      JSON.stringify(verifyRes.data, null, 2)
+    );
+
+    if (verifyRes.status !== 200) {
+      return res.status(400).json({
+        error:
+          verifyRes.data.message || "Identity verification initiation failed",
+        details: verifyRes.data,
+      });
+    }
+
+    // Check if verification was successful
+    if (!verifyRes.data.data || verifyRes.data.data.status !== "SUCCESS") {
+      return res.status(400).json({
+        error: "BVN verification failed or pending",
+        status: verifyRes.data.data?.status,
+        message: verifyRes.data.message,
+      });
     }
 
     const identityId = verifyRes.data.data._id;
+    const otpId = verifyRes.data.data.otpId;
 
-    // 2. Create Sub-Account (Static VA)
-    const createPayload = {
-      phoneNumber: `+234${phoneNumber.slice(1)}`, // Format to +234...
-      emailAddress,
-      externalReference: `user_va_${userId}`,
-      identityType: "BVN",
-      identityNumber: bvn,
-      identityId,
-      autoSweep: false, // No auto-sweep, funds stay for webhook to credit wallet
-      callbackUrl: "https://higestdata-proxy.onrender.com/webhook", // Your webhook URL (register in dashboard too)
+    console.log(`Identity ID: ${identityId}, OTP ID: ${otpId}`);
+
+    // ============================================
+    // STEP 2: VALIDATE VERIFICATION WITH OTP
+    // ============================================
+    console.log("Step 2: Validating OTP...");
+    const validatePayload = {
+      identityId: identityId,
+      type: "BVN",
+      otp: otp, // OTP sent to customer's phone
     };
 
+    const validateRes = await makeSafeHavenRequest(
+      "/identity/v2/validate",
+      "POST",
+      validatePayload
+    );
+
+    console.log(
+      "OTP Validation Response:",
+      JSON.stringify(validateRes.data, null, 2)
+    );
+
+    if (validateRes.status !== 200) {
+      return res.status(400).json({
+        error: validateRes.data.message || "OTP validation failed",
+        details: validateRes.data,
+      });
+    }
+
+    // Check if OTP verification was successful
+    if (!validateRes.data.data || !validateRes.data.data.otpVerified) {
+      return res.status(400).json({
+        error: "OTP verification failed",
+        otpVerified: validateRes.data.data?.otpVerified || false,
+      });
+    }
+
+    console.log("OTP verified successfully!");
+
+    // ============================================
+    // STEP 3: CREATE SUB-ACCOUNT (STATIC VA)
+    // ============================================
+    console.log("Step 3: Creating sub-account...");
+    const createPayload = {
+      phoneNumber: phoneNumber.startsWith("+234")
+        ? phoneNumber
+        : `+234${phoneNumber.replace(/\D/g, "").slice(-10)}`,
+      emailAddress: emailAddress,
+      externalReference: `user_va_${userId}_${Date.now()}`,
+      identityType: "BVN",
+      identityNumber: bvn,
+      identityId: identityId,
+      otp: otp, // IMPORTANT: Include OTP for sub-account creation
+      autoSweep: false,
+      callbackUrl: "https://higestdata-proxy.onrender.com/webhook",
+      autoSweepDetails: {
+        // Added required structure even if not used
+        schedule: "Instant",
+        accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
+      },
+    };
+
+    // ADD ClientID header as shown in docs
+    const token = await getSafeHavenToken();
     const createRes = await makeSafeHavenRequest(
       "/accounts/v2/subaccount",
       "POST",
-      createPayload
+      createPayload,
+      { ClientID: process.env.SAFE_HAVEN_CLIENT_ID } // Extra headers
     );
 
-    if (createRes.status !== 200 || !createRes.data.data.accountNumber) {
-      console.error("Create VA failed:", createRes.data);
-      return res
-        .status(400)
-        .json({
-          error: createRes.data.message || "Failed to create virtual account",
-        });
+    console.log(
+      "Create Account Response:",
+      JSON.stringify(createRes.data, null, 2)
+    );
+
+    if (createRes.status !== 200 || !createRes.data.data?.accountNumber) {
+      return res.status(400).json({
+        error: createRes.data.message || "Failed to create virtual account",
+        details: createRes.data,
+      });
     }
 
     const vaData = createRes.data.data;
 
-    // 3. Save to User Doc (Production: Use batch for atomicity)
+    // Save to User Doc
     await userRef.update({
       virtualAccount: {
         accountNumber: vaData.accountNumber,
         accountName: vaData.accountName,
-        bankCode: "090286", // Safe Haven MFB code
+        bankCode: "090286",
         bankName: "Safe Haven MFB",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        fullDetails: {
+          // Store for debugging
+          identityId: identityId,
+          bvn: bvn,
+          createdAt: new Date().toISOString(),
+        },
       },
     });
 
     res.json({
       success: true,
       message: "Virtual account created successfully",
-      data: vaData,
+      data: {
+        accountNumber: vaData.accountNumber,
+        accountName: vaData.accountName,
+        bankName: "Safe Haven MFB",
+        bankCode: "090286",
+      },
     });
   } catch (error) {
     console.error("Create VA error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({
+      error: "Internal server error",
+      message: error.message,
+    });
   }
 });
 
