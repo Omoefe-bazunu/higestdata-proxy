@@ -262,64 +262,24 @@ async function checkSafeHavenTransferStatus(sessionId) {
 }
 
 // === HELPER: SAFE HAVEN REQUEST ===
-// async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
-//   try {
-//     const token = await getSafeHavenToken();
-//     const headers = {
-//       Authorization: `Bearer ${token}`,
-//       "Content-Type": "application/json",
-//       ClientID: SH_CLIENT_ID,
-//     };
-
-//     const config = { method, headers };
-//     if (body) config.body = JSON.stringify(body);
-
-//     console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
-
-//     const res = await fetch(`${SH_API_URL}${endpoint}`, config);
-//     const data = await res.json();
-
-//     // Log errors for debugging
-//     if (!res.ok) {
-//       console.error(
-//         `SH API Error (${res.status}):`,
-//         JSON.stringify(data, null, 2)
-//       );
-//     }
-
-//     return { status: res.status, data };
-//   } catch (error) {
-//     console.error("makeSafeHavenRequest Error:", error);
-//     // Return a structured error so the route handler doesn't crash
-//     return { status: 500, data: { message: error.message } };
-//   }
-// }
-
-// === HELPER: SAFE HAVEN REQUEST ===
-async function makeSafeHavenRequest(
-  endpoint,
-  method = "GET",
-  body = null,
-  extraHeaders = {}
-) {
+async function makeSafeHavenRequest(endpoint, method = "GET", body = null) {
   try {
     const token = await getSafeHavenToken();
     const headers = {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
-      ...extraHeaders, // Allow extra headers
+      ClientID: SH_CLIENT_ID,
     };
 
     const config = { method, headers };
     if (body) config.body = JSON.stringify(body);
 
     console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
-    console.log(`SH Headers:`, headers);
-    if (body) console.log(`SH Body:`, body);
 
     const res = await fetch(`${SH_API_URL}${endpoint}`, config);
     const data = await res.json();
 
+    // Log errors for debugging
     if (!res.ok) {
       console.error(
         `SH API Error (${res.status}):`,
@@ -330,9 +290,49 @@ async function makeSafeHavenRequest(
     return { status: res.status, data };
   } catch (error) {
     console.error("makeSafeHavenRequest Error:", error);
+    // Return a structured error so the route handler doesn't crash
     return { status: 500, data: { message: error.message } };
   }
 }
+
+// // === HELPER: SAFE HAVEN REQUEST ===
+// async function makeSafeHavenRequest(
+//   endpoint,
+//   method = "GET",
+//   body = null,
+//   extraHeaders = {}
+// ) {
+//   try {
+//     const token = await getSafeHavenToken();
+//     const headers = {
+//       Authorization: `Bearer ${token}`,
+//       "Content-Type": "application/json",
+//       ...extraHeaders, // Allow extra headers
+//     };
+
+//     const config = { method, headers };
+//     if (body) config.body = JSON.stringify(body);
+
+//     console.log(`SH Request: ${method} ${SH_API_URL}${endpoint}`);
+//     console.log(`SH Headers:`, headers);
+//     if (body) console.log(`SH Body:`, body);
+
+//     const res = await fetch(`${SH_API_URL}${endpoint}`, config);
+//     const data = await res.json();
+
+//     if (!res.ok) {
+//       console.error(
+//         `SH API Error (${res.status}):`,
+//         JSON.stringify(data, null, 2)
+//       );
+//     }
+
+//     return { status: res.status, data };
+//   } catch (error) {
+//     console.error("makeSafeHavenRequest Error:", error);
+//     return { status: 500, data: { message: error.message } };
+//   }
+// }
 
 // --- Helper: Make OgaViral Request ---
 async function makeOgaviralRequest(action, params = {}) {
