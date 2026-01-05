@@ -2594,7 +2594,7 @@ app.post("/api/funding/verify", async (req, res) => {
 
 // === VIRTUAL ACCOUNT MANAGEMENT ===
 
-// 1. Initiate BVN/NIN Verification (Step 1)
+// 1. Initiate BVN/NIN Verification (Step 1) - FIXED
 app.post("/api/virtual-account/initiate-verification", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2603,9 +2603,9 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
 
   try {
     const userId = await verifyFirebaseToken(idToken);
-    const { type, number, debitAccountNumber } = req.body;
+    const { type, number } = req.body;
 
-    if (!type || !number || !debitAccountNumber) {
+    if (!type || !number) {
       return res.status(400).json({ error: "Missing required parameters" });
     }
 
@@ -2613,6 +2613,25 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
     if (!["BVN", "NIN"].includes(type)) {
       return res.status(400).json({ error: "Type must be BVN or NIN" });
     }
+
+    // Validate number length
+    if (number.length !== 11) {
+      return res.status(400).json({ error: `${type} must be 11 digits` });
+    }
+
+    // Use the main business account from env (not user input)
+    const debitAccountNumber = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+
+    if (!debitAccountNumber) {
+      console.error("SAFE_HAVEN_MAIN_ACCOUNT not configured");
+      return res.status(500).json({ error: "System configuration error" });
+    }
+
+    console.log("Initiating verification:", {
+      type,
+      number,
+      debitAccountNumber,
+    });
 
     const { status, data } = await makeSafeHavenRequest(
       "/identity/v2",
@@ -2623,6 +2642,8 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
         debitAccountNumber,
       }
     );
+
+    console.log("Safe Haven Response:", JSON.stringify(data, null, 2));
 
     if (status === 200 && data.data?._id) {
       // Store verification ID temporarily
@@ -2644,9 +2665,11 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
         identityId: data.data._id,
       });
     } else {
+      // Log the full error for debugging
+      console.error("Verification initiation failed:", data);
       res.status(400).json({
-        error: data.message || "Verification initiation failed",
-        data,
+        error: data.message || data.error || "Verification initiation failed",
+        details: data,
       });
     }
   } catch (error) {
@@ -2655,7 +2678,7 @@ app.post("/api/virtual-account/initiate-verification", async (req, res) => {
   }
 });
 
-// 2. Validate Verification (Step 2)
+// 2. Validate Verification (Step 2) - NO CHANGES NEEDED
 app.post("/api/virtual-account/validate-verification", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2717,7 +2740,7 @@ app.post("/api/virtual-account/validate-verification", async (req, res) => {
   }
 });
 
-// 3. Create Virtual Account (Step 3)
+// 3. Create Virtual Account (Step 3) - NO CHANGES NEEDED
 app.post("/api/virtual-account/create", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2793,7 +2816,7 @@ app.post("/api/virtual-account/create", async (req, res) => {
   }
 });
 
-// 4. Get Virtual Account Details
+// 4. Get Virtual Account Details - FIXED
 app.get("/api/virtual-account", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2810,7 +2833,7 @@ app.get("/api/virtual-account", async (req, res) => {
         success: true,
         hasAccount: false,
         hasVerifiedIdentity: !!userData.verifiedIdentity?.verified,
-        hasPendingVerification: !!userData.pendingVerification,
+        hasPendingVerification: false, // Always false initially
       });
     }
 
