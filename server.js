@@ -3132,15 +3132,13 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 //   }
 // });
 
-// ==========================================
-// VIRTUAL ACCOUNT CREATION - FIXED VERSION
-// ==========================================
+// === VIRTUAL ACCOUNT CREATION ENDPOINTS ===
 
-// === STEP 1: INITIATE VERIFICATION (Send OTP) ===
+// 1. Initiate BVN Verification (Already exists but needs correction)
 app.post("/api/virtual-account/initiate", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ success: false, error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
 
   try {
@@ -3148,82 +3146,72 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
     const { bvn } = req.body;
 
     if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({
-        success: false,
-        error: "Valid 11-digit BVN required",
-      });
+      return res.status(400).json({ error: "Valid 11-digit BVN required" });
     }
 
-    // Get user's debit account (your main account or user's linked account)
-    const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+    // Get user's email
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
 
-    console.log("Initiating BVN verification for:", bvn);
-
-    // Call Safe Haven Identity Verification
+    // Make Safe Haven Initiate Verification request
     const { status, data } = await makeSafeHavenRequest(
       "/identity/v2",
       "POST",
       {
         type: "BVN",
         number: bvn,
-        debitAccountNumber: DEBIT_ACCOUNT,
-        // Don't send OTP here - Safe Haven will send it to BVN phone
+        debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT, // Your merchant account
       }
     );
 
-    console.log("Safe Haven Initiate Response:", JSON.stringify(data, null, 2));
-
     if (status === 200 && data.data?._id) {
-      return res.json({
+      // Save identityId to user document temporarily
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          bvnVerification: {
+            identityId: data.data._id,
+            bvn: bvn,
+            initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+        });
+
+      res.json({
         success: true,
         identityId: data.data._id,
-        message: "OTP sent to BVN-registered phone number",
+        message: "OTP sent to your BVN phone number",
       });
     } else {
-      // Extract actual error message from Safe Haven response
-      const errorMsg =
-        data.message ||
-        data.error ||
-        data.data?.message ||
-        "Verification initiation failed";
-
-      console.error("Safe Haven Error:", data);
-      return res.status(400).json({
-        success: false,
-        error: errorMsg,
-      });
+      throw new Error(data.message || "Failed to initiate verification");
     }
   } catch (error) {
-    console.error("Initiate Error:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message || "Server error during initiation",
-    });
+    console.error("Initiate verification error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === STEP 2: FINALIZE (Validate OTP + Create Account) ===
+// 2. Validate OTP and Create Account (Unified endpoint)
 app.post("/api/virtual-account/finalize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ success: false, error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
 
   try {
     const userId = await verifyFirebaseToken(idToken);
     const { identityId, otp, bvn } = req.body;
 
-    if (!identityId || !otp) {
-      return res.status(400).json({
-        success: false,
-        error: "Identity ID and OTP required",
-      });
+    if (!identityId || !otp || !bvn) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
-    console.log("Validating OTP for identityId:", identityId);
+    // Get user data
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
 
-    // STEP 2A: Validate the OTP
-    const validateRes = await makeSafeHavenRequest(
+    // Validate OTP with Safe Haven
+    const validateResponse = await makeSafeHavenRequest(
       "/identity/v2/validate",
       "POST",
       {
@@ -3233,85 +3221,85 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
       }
     );
 
-    console.log(
-      "Validation Response:",
-      JSON.stringify(validateRes.data, null, 2)
-    );
-
-    // Check if validation was successful
-    if (validateRes.status !== 200 || validateRes.data.statusCode !== 200) {
-      const errorMsg =
-        validateRes.data.message ||
-        validateRes.data.error ||
-        "OTP validation failed";
-
+    if (validateResponse.status !== 200 || !validateResponse.data.data) {
       return res.status(400).json({
-        success: false,
-        error: errorMsg,
+        error: "Invalid OTP or verification failed",
+        details: validateResponse.data.message,
       });
     }
 
-    // Get user details for account creation
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
+    const verifiedData = validateResponse.data.data;
 
-    console.log("Creating sub-account for user:", userId);
-
-    // STEP 2B: Create the sub-account using validated identity
-    const createRes = await makeSafeHavenRequest(
+    // Create virtual account with Safe Haven
+    const accountResponse = await makeSafeHavenRequest(
       "/accounts/v2/subaccount",
       "POST",
       {
-        phoneNumber: userData.phoneNumber || "+2340000000000",
+        phoneNumber:
+          userData.phoneNumber ||
+          `+234${
+            userData.email.match(/\d+/g)?.join("").substring(0, 10) ||
+            "0000000000"
+          }`,
         emailAddress: userData.email,
-        externalReference: userId, // Use userId as external reference
-        identityType: "vID", // Using validated ID
-        identityId: identityId, // The validated identity ID
-        callbackUrl: "https://higestdata-proxy.onrender.com/webhook",
+        externalReference: `USER_${userId}`,
+        identityType: "BVN",
+        identityNumber: bvn,
+        identityId: identityId,
+        otp: otp,
+        callbackUrl:
+          process.env.WEBHOOK_URL ||
+          "https://higestdata-proxy.onrender.com/webhooks",
         autoSweep: false,
       }
     );
 
-    console.log(
-      "Account Creation Response:",
-      JSON.stringify(createRes.data, null, 2)
-    );
+    if (accountResponse.status === 200 && accountResponse.data.data) {
+      const accountData = accountResponse.data.data;
 
-    if (createRes.status === 200 && createRes.data.data?.accountNumber) {
-      const accountData = {
-        accountNumber: createRes.data.data.accountNumber,
-        accountName: createRes.data.data.accountName,
-        bankName: "Safe Haven MFB",
-        bankCode: "090286",
-        createdAt: new Date().toISOString(),
-      };
+      // Save virtual account details to user
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          virtualAccount: {
+            accountNumber: accountData.accountNumber,
+            accountName: accountData.accountName,
+            bankName: "Safe Haven MFB",
+            bankCode: "090286",
+            reference: accountData.externalReference,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          bvnVerified: true,
+          bvn: bvn,
+          fullName:
+            verifiedData.providerResponse?.fullName || userData.fullName,
+        });
 
-      // Save to Firestore
+      // Clear temporary verification data
       await db.collection("users").doc(userId).update({
-        virtualAccount: accountData,
+        bvnVerification: admin.firestore.FieldValue.delete(),
       });
 
-      return res.json({
+      res.json({
         success: true,
-        account: accountData,
+        account: {
+          accountNumber: accountData.accountNumber,
+          accountName: accountData.accountName,
+          bankName: "Safe Haven MFB",
+        },
         message: "Virtual account created successfully",
       });
     } else {
-      const errorMsg =
-        createRes.data.message ||
-        createRes.data.error ||
-        "Account creation failed";
-
-      return res.status(400).json({
-        success: false,
-        error: errorMsg,
-      });
+      throw new Error(
+        accountResponse.data.message || "Failed to create account"
+      );
     }
   } catch (error) {
-    console.error("Finalize Error:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message || "Server error during finalization",
+    console.error("Finalize error:", error);
+    res.status(500).json({
+      error: error.message,
+      details: "Please try again. If problem persists, contact support.",
     });
   }
 });
