@@ -3007,53 +3007,132 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
   }
 });
 // 2. Validate Identity Verification (Step 2: Verify OTP)
-app.post("/api/virtual-account/validate", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
+// app.post("/api/virtual-account/validate", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
 
-  try {
-    await verifyFirebaseToken(idToken);
-    const { identityId, otp } = req.body;
+//   try {
+//     await verifyFirebaseToken(idToken);
+//     const { identityId, otp } = req.body;
 
-    if (!identityId || !otp) {
-      return res.status(400).json({ error: "Missing Identity ID or OTP" });
-    }
+//     if (!identityId || !otp) {
+//       return res.status(400).json({ error: "Missing Identity ID or OTP" });
+//     }
 
-    // Docs: Validate Verification -> POST /identity/v2/validate
-    const response = await makeSafeHavenRequest(
-      "/identity/v2/validate",
-      "POST",
-      {
-        identityId: identityId,
-        type: "BVN",
-        otp: otp,
-      }
-    );
+//     // Docs: Validate Verification -> POST /identity/v2/validate
+//     const response = await makeSafeHavenRequest(
+//       "/identity/v2/validate",
+//       "POST",
+//       {
+//         identityId: identityId,
+//         type: "BVN",
+//         otp: otp,
+//       }
+//     );
 
-    const data = response.data;
+//     const data = response.data;
 
-    if (data.statusCode === 200 || data.data?.status === "SUCCESS") {
-      res.json({
-        success: true,
-        message: "Identity verified successfully",
-        identityId: data.data._id,
-      });
-    } else {
-      res.status(400).json({
-        error: data.message || "Invalid OTP",
-        details: data,
-      });
-    }
-  } catch (error) {
-    console.error("Identity Validate Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
+//     if (data.statusCode === 200 || data.data?.status === "SUCCESS") {
+//       res.json({
+//         success: true,
+//         message: "Identity verified successfully",
+//         identityId: data.data._id,
+//       });
+//     } else {
+//       res.status(400).json({
+//         error: data.message || "Invalid OTP",
+//         details: data,
+//       });
+//     }
+//   } catch (error) {
+//     console.error("Identity Validate Error:", error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
 
-// 3. Create Sub-Account (Step 3: Create & Save)
-app.post("/api/virtual-account/create", async (req, res) => {
+// // 3. Create Sub-Account (Step 3: Create & Save)
+// app.post("/api/virtual-account/create", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
+
+//   try {
+//     const userId = await verifyFirebaseToken(idToken);
+//     const { identityId, bvn } = req.body;
+
+//     // Get User Profile
+//     const userDoc = await db.collection("users").doc(userId).get();
+//     const userData = userDoc.data();
+
+//     // Idempotency: Return existing if available
+//     if (userData.virtualAccount?.accountNumber) {
+//       return res.json({ success: true, account: userData.virtualAccount });
+//     }
+
+//     // Docs: Create Sub Account (Individual) -> POST /accounts/v2/subaccount
+//     // We use identityType: 'vID' because we have already validated the identity in the previous step
+//     const payload = {
+//       phoneNumber: userData.phoneNumber || "+2348000000000",
+//       emailAddress:
+//         userData.email || `user${userId.substring(0, 5)}@highestdata.com`,
+//       externalReference: `SUB-${userId}-${Date.now()}`,
+//       identityType: "vID",
+//       identityId: identityId,
+//       autoSweep: false, // Static account
+//     };
+
+//     const response = await makeSafeHavenRequest(
+//       "/accounts/v2/subaccount",
+//       "POST",
+//       payload
+//     );
+//     const data = response.data;
+
+//     if (data.statusCode === 200 && data.data?.accountNumber) {
+//       const accountData = data.data;
+
+//       const savedAccount = {
+//         accountNumber: accountData.accountNumber,
+//         accountName: accountData.accountName,
+//         bankName: "Safe Haven MFB",
+//         bankCode: "090286",
+//         safeHavenId: accountData._id,
+//         createdDate: new Date().toISOString(),
+//       };
+
+//       // Save to Firestore
+//       await db
+//         .collection("users")
+//         .doc(userId)
+//         .update({
+//           virtualAccount: savedAccount,
+//           bvnVerified: true,
+//           bvnMasked: bvn
+//             ? `${bvn.substring(0, 4)}****${bvn.substring(8)}`
+//             : null,
+//         });
+
+//       res.json({
+//         success: true,
+//         message: "Virtual account created successfully",
+//         account: savedAccount,
+//       });
+//     } else {
+//       console.error("Create SubAccount Failed:", JSON.stringify(data));
+//       res
+//         .status(400)
+//         .json({ error: data.message || "Failed to create account" });
+//     }
+//   } catch (error) {
+//     console.error("Create Account Error:", error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
+
+app.post("/api/virtual-account/finalize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized" });
@@ -3061,38 +3140,78 @@ app.post("/api/virtual-account/create", async (req, res) => {
 
   try {
     const userId = await verifyFirebaseToken(idToken);
-    const { identityId, bvn } = req.body;
+    const { identityId, otp, bvn } = req.body;
 
-    // Get User Profile
+    // 1. Validate Inputs
+    if (!identityId || !otp || !bvn) {
+      return res
+        .status(400)
+        .json({ error: "Missing required fields (Identity ID, OTP, or BVN)" });
+    }
+
+    // 2. Validate OTP with Safe Haven
+    console.log(`Verifying OTP for User ${userId}...`);
+    const validateRes = await makeSafeHavenRequest(
+      "/identity/v2/validate",
+      "POST",
+      {
+        identityId: identityId,
+        type: "BVN",
+        otp: otp.trim(),
+      }
+    );
+
+    const valData = validateRes.data;
+
+    // Check validation success
+    // Note: We accept statusCode 200 OR explicit status "SUCCESS"
+    const isVerified =
+      valData.statusCode == 200 ||
+      valData.data?.status === "SUCCESS" ||
+      valData.message?.toLowerCase().includes("successfully");
+
+    if (!isVerified) {
+      console.error("OTP Verification Failed:", JSON.stringify(valData));
+      return res.status(400).json({
+        error: valData.message || "Invalid OTP. Please try again.",
+        details: valData,
+      });
+    }
+
+    // 3. Create Sub-Account (Idempotency check)
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    // Idempotency: Return existing if available
     if (userData.virtualAccount?.accountNumber) {
-      return res.json({ success: true, account: userData.virtualAccount });
+      return res.json({
+        success: true,
+        message: "Account already exists",
+        account: userData.virtualAccount,
+      });
     }
 
-    // Docs: Create Sub Account (Individual) -> POST /accounts/v2/subaccount
-    // We use identityType: 'vID' because we have already validated the identity in the previous step
-    const payload = {
+    // 4. Call Safe Haven Create Sub-Account
+    // We use identityType: 'vID' because we just successfully validated it above
+    const createPayload = {
       phoneNumber: userData.phoneNumber || "+2348000000000",
       emailAddress:
         userData.email || `user${userId.substring(0, 5)}@highestdata.com`,
       externalReference: `SUB-${userId}-${Date.now()}`,
       identityType: "vID",
       identityId: identityId,
-      autoSweep: false, // Static account
+      autoSweep: false,
     };
 
-    const response = await makeSafeHavenRequest(
+    console.log(`Creating Account for User ${userId}...`);
+    const createRes = await makeSafeHavenRequest(
       "/accounts/v2/subaccount",
       "POST",
-      payload
+      createPayload
     );
-    const data = response.data;
+    const createData = createRes.data;
 
-    if (data.statusCode === 200 && data.data?.accountNumber) {
-      const accountData = data.data;
+    if (createData.statusCode == 200 && createData.data?.accountNumber) {
+      const accountData = createData.data;
 
       const savedAccount = {
         accountNumber: accountData.accountNumber,
@@ -3103,31 +3222,30 @@ app.post("/api/virtual-account/create", async (req, res) => {
         createdDate: new Date().toISOString(),
       };
 
-      // Save to Firestore
+      // 5. Save to Firestore
       await db
         .collection("users")
         .doc(userId)
         .update({
           virtualAccount: savedAccount,
           bvnVerified: true,
-          bvnMasked: bvn
-            ? `${bvn.substring(0, 4)}****${bvn.substring(8)}`
-            : null,
+          bvnMasked: `${bvn.substring(0, 4)}****${bvn.substring(8)}`,
         });
 
-      res.json({
+      return res.json({
         success: true,
-        message: "Virtual account created successfully",
+        message: "Account created successfully",
         account: savedAccount,
       });
     } else {
-      console.error("Create SubAccount Failed:", JSON.stringify(data));
-      res
-        .status(400)
-        .json({ error: data.message || "Failed to create account" });
+      console.error("Account Creation Failed:", JSON.stringify(createData));
+      return res.status(400).json({
+        error: createData.message || "Failed to generate account number",
+        details: createData,
+      });
     }
   } catch (error) {
-    console.error("Create Account Error:", error);
+    console.error("Finalize Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
