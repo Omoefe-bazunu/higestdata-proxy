@@ -2948,6 +2948,7 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 // ==========================================
 
 // 1. Initiate Identity Verification (Step 1: Send OTP)
+// 1. Initiate Identity Verification (Step 1: Send OTP)
 app.post("/api/virtual-account/initiate", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2962,10 +2963,19 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
       return res.status(400).json({ error: "Valid 11-digit BVN is required" });
     }
 
-    // Docs: Initiate Verification -> POST /identity/v2
+    // [FIX] Ensure we have the debit account
+    const debitAccount = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+    if (!debitAccount) {
+      console.error("CRITICAL: SAFE_HAVEN_MAIN_ACCOUNT env var is missing");
+      return res.status(500).json({ error: "Server configuration error" });
+    }
+
+    [cite_start]; // Docs: Initiate Verification -> POST /identity/v2 [cite: 450]
+    // [FIX] Added 'debitAccountNumber' which is REQUIRED
     const response = await makeSafeHavenRequest("/identity/v2", "POST", {
       type: "BVN",
       number: bvn,
+      debitAccountNumber: debitAccount, // <--- CRITICAL FIX
       async: false, // Request immediate response
     });
 
@@ -2982,8 +2992,12 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
         identityId: data.data._id,
       });
     } else {
+      console.error("SH Init Failed:", JSON.stringify(data));
+      // Pass the specific error message from Safe Haven if available
+      const errorMessage =
+        data.message || data.error || "Verification initiation failed";
       res.status(400).json({
-        error: data.message || "Verification initiation failed",
+        error: errorMessage,
         details: data,
       });
     }
@@ -2992,7 +3006,6 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 // 2. Validate Identity Verification (Step 2: Verify OTP)
 app.post("/api/virtual-account/validate", async (req, res) => {
   const authHeader = req.headers.authorization;
