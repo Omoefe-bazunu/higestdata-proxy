@@ -3132,117 +3132,187 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 //   }
 // });
 
-// Helper: Ensure phone is in +234 format (Strict requirement)
-// function formatPhoneNumber(phone) {
-//   if (!phone) return "+2348000000000";
-//   let clean = phone.replace(/\D/g, "");
-//   if (clean.startsWith("0")) {
-//     clean = "234" + clean.substring(1);
-//   }
-//   return "+" + clean;
-// }
+// ==========================================
+// VIRTUAL ACCOUNT CREATION - FIXED VERSION
+// ==========================================
 
-// === VIRTUAL ACCOUNT INITIATE ===
+// === STEP 1: INITIATE VERIFICATION (Send OTP) ===
 app.post("/api/virtual-account/initiate", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({ success: false, error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
-  let userId;
+
   try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-  const { bvn } = req.body;
-  if (!bvn || bvn.length !== 11)
-    return res.status(400).json({ error: "Invalid BVN" });
-  try {
+    const userId = await verifyFirebaseToken(idToken);
+    const { bvn } = req.body;
+
+    if (!bvn || bvn.length !== 11) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid 11-digit BVN required",
+      });
+    }
+
+    // Get user's debit account (your main account or user's linked account)
+    const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+
+    console.log("Initiating BVN verification for:", bvn);
+
+    // Call Safe Haven Identity Verification
     const { status, data } = await makeSafeHavenRequest(
       "/identity/v2",
       "POST",
       {
         type: "BVN",
         number: bvn,
-        debitAccountNumber: process.env.SAFE_HAVEN_DEBIT_ACCOUNT,
+        debitAccountNumber: DEBIT_ACCOUNT,
+        // Don't send OTP here - Safe Haven will send it to BVN phone
       }
     );
-    if (status === 200 && data.statusCode === 200) {
-      return res.json({ success: true, identityId: data.data._id });
+
+    console.log("Safe Haven Initiate Response:", JSON.stringify(data, null, 2));
+
+    if (status === 200 && data.data?._id) {
+      return res.json({
+        success: true,
+        identityId: data.data._id,
+        message: "OTP sent to BVN-registered phone number",
+      });
     } else {
-      return res
-        .status(400)
-        .json({ error: data.message || "Initiation failed" });
+      // Extract actual error message from Safe Haven response
+      const errorMsg =
+        data.message ||
+        data.error ||
+        data.data?.message ||
+        "Verification initiation failed";
+
+      console.error("Safe Haven Error:", data);
+      return res.status(400).json({
+        success: false,
+        error: errorMsg,
+      });
     }
   } catch (error) {
     console.error("Initiate Error:", error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Server error during initiation",
+    });
   }
 });
 
-// === VIRTUAL ACCOUNT FINALIZE ===
+// === STEP 2: FINALIZE (Validate OTP + Create Account) ===
 app.post("/api/virtual-account/finalize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({ success: false, error: "Unauthorized" });
   const idToken = authHeader.split("Bearer ")[1];
-  let userId;
+
   try {
-    userId = await verifyFirebaseToken(idToken);
-  } catch (err) {
-    return res.status(401).json({ error: err.message });
-  }
-  const { identityId, otp, bvn } = req.body;
-  const userDoc = await db.collection("users").doc(userId).get();
-  if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
-  const userData = userDoc.data();
-  const phoneNumber = userData.phoneNumber;
-  const emailAddress = userData.email;
-  if (!phoneNumber || !emailAddress)
-    return res.status(400).json({ error: "User profile incomplete" });
-  const externalReference = `va-${userId}`;
-  const callbackUrl = `${process.env.BASE_URL}/webhook`;
-  try {
-    const { status, data } = await makeSafeHavenRequest(
+    const userId = await verifyFirebaseToken(idToken);
+    const { identityId, otp, bvn } = req.body;
+
+    if (!identityId || !otp) {
+      return res.status(400).json({
+        success: false,
+        error: "Identity ID and OTP required",
+      });
+    }
+
+    console.log("Validating OTP for identityId:", identityId);
+
+    // STEP 2A: Validate the OTP
+    const validateRes = await makeSafeHavenRequest(
+      "/identity/v2/validate",
+      "POST",
+      {
+        identityId: identityId,
+        type: "BVN",
+        otp: otp,
+      }
+    );
+
+    console.log(
+      "Validation Response:",
+      JSON.stringify(validateRes.data, null, 2)
+    );
+
+    // Check if validation was successful
+    if (validateRes.status !== 200 || validateRes.data.statusCode !== 200) {
+      const errorMsg =
+        validateRes.data.message ||
+        validateRes.data.error ||
+        "OTP validation failed";
+
+      return res.status(400).json({
+        success: false,
+        error: errorMsg,
+      });
+    }
+
+    // Get user details for account creation
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    console.log("Creating sub-account for user:", userId);
+
+    // STEP 2B: Create the sub-account using validated identity
+    const createRes = await makeSafeHavenRequest(
       "/accounts/v2/subaccount",
       "POST",
       {
-        phoneNumber,
-        emailAddress,
-        externalReference,
-        identityType: "BVN",
-        identityNumber: bvn,
-        identityId,
-        otp,
-        callbackUrl,
+        phoneNumber: userData.phoneNumber || "+2340000000000",
+        emailAddress: userData.email,
+        externalReference: userId, // Use userId as external reference
+        identityType: "vID", // Using validated ID
+        identityId: identityId, // The validated identity ID
+        callbackUrl: "https://higestdata-proxy.onrender.com/webhook",
         autoSweep: false,
       }
     );
-    if (status === 200 && data.statusCode === 200) {
-      const account = data.data;
-      await userDoc.ref.update({
-        virtualAccount: {
-          accountNumber: account.accountNumber,
-          accountName: account.accountName,
-          bankName: "Safe Haven MFB",
-        },
+
+    console.log(
+      "Account Creation Response:",
+      JSON.stringify(createRes.data, null, 2)
+    );
+
+    if (createRes.status === 200 && createRes.data.data?.accountNumber) {
+      const accountData = {
+        accountNumber: createRes.data.data.accountNumber,
+        accountName: createRes.data.data.accountName,
+        bankName: "Safe Haven MFB",
+        bankCode: "090286",
+        createdAt: new Date().toISOString(),
+      };
+
+      // Save to Firestore
+      await db.collection("users").doc(userId).update({
+        virtualAccount: accountData,
       });
+
       return res.json({
         success: true,
-        account: {
-          accountNumber: account.accountNumber,
-          accountName: account.accountName,
-          bankName: "Safe Haven MFB",
-        },
+        account: accountData,
+        message: "Virtual account created successfully",
       });
     } else {
-      return res
-        .status(400)
-        .json({ error: data.message || "Finalization failed" });
+      const errorMsg =
+        createRes.data.message ||
+        createRes.data.error ||
+        "Account creation failed";
+
+      return res.status(400).json({
+        success: false,
+        error: errorMsg,
+      });
     }
   } catch (error) {
     console.error("Finalize Error:", error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Server error during finalization",
+    });
   }
 });
 
