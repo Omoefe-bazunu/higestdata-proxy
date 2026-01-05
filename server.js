@@ -3136,6 +3136,7 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 
 // 1. Initiate BVN Verification (Already exists but needs correction)
 // === VIRTUAL ACCOUNT INITIATE VERIFICATION ===
+// === VIRTUAL ACCOUNT INITIATE VERIFICATION ===
 app.post("/api/virtual-account/initiate", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -3150,14 +3151,7 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
       return res.status(400).json({ error: "Valid 11-digit BVN required" });
     }
 
-    console.log("Initiating BVN verification for user:", userId, "BVN:", bvn);
-
-    // Get user data to get email for reference
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
     // Make Safe Haven Initiate Verification request
-    // Note: According to docs, OTP is optional in initiate - only needed for BVNUSSD
     const { status, data } = await makeSafeHavenRequest(
       "/identity/v2",
       "POST",
@@ -3165,62 +3159,52 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
         type: "BVN",
         number: bvn,
         debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
-        // otp: "", // Only for BVNUSSD
-        // verifierId: "", // Only for vNIN
-        // provider: "creditRegistry", // Only for CREDITCHECK
-        // async: true // Only for CREDITCHECK
       }
     );
-
-    console.log("Safe Haven initiate response status:", status);
-    console.log("Safe Haven initiate response:", JSON.stringify(data, null, 2));
 
     // Check if request was successful
     if (data.statusCode === 200) {
       const identityId = data.data?._id;
-      const otpId = data.data?.otpId;
 
       if (!identityId) {
         throw new Error("No identity ID returned from Safe Haven");
       }
 
-      // Save verification data to user document
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          bvnVerification: {
-            identityId: identityId,
-            bvn: bvn,
-            identityNumber: data.data?.identityNumber || bvn,
-            status: data.data?.status || "SUCCESS",
-            otpVerified: data.data?.otpVerified || false,
-            otpId: otpId,
-            providerResponse: data.data?.providerResponse,
-            initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        });
+      // SIMPLE FIX: Only include providerResponse if it exists
+      const verificationData = {
+        identityId: identityId,
+        bvn: bvn,
+        identityNumber: data.data?.identityNumber || bvn,
+        status: data.data?.status || "SUCCESS",
+        otpVerified: data.data?.otpVerified || false,
+        otpId: data.data?.otpId || null,
+        initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
 
-      // Check if OTP is already verified (might be auto-verified in some cases)
+      // ADD ONLY IF IT EXISTS
+      if (data.data?.providerResponse) {
+        verificationData.providerResponse = data.data.providerResponse;
+      }
+
+      // Save verification data to user document
+      await db.collection("users").doc(userId).update({
+        bvnVerification: verificationData,
+      });
+
       const otpVerified = data.data?.otpVerified || false;
 
       res.json({
         success: true,
         identityId: identityId,
-        otpId: otpId,
         otpVerified: otpVerified,
         message: otpVerified
-          ? "BVN verified successfully. You can now create your virtual account."
-          : "OTP sent to your BVN phone number. Please check and enter the OTP.",
-        status: data.data?.status,
-        requiresOtp: !otpVerified, // Flag for frontend to know if OTP step is needed
+          ? "BVN verified successfully"
+          : "OTP sent to your BVN phone number",
       });
     } else {
-      // Handle error response
-      res.status(status).json({
+      res.status(400).json({
         success: false,
         error: data.message || "Failed to initiate verification",
-        statusCode: data.statusCode,
       });
     }
   } catch (error) {
@@ -3228,10 +3212,10 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message,
-      details: "Failed to initiate BVN verification",
     });
   }
 });
+
 // === VALIDATE OTP AND CREATE VIRTUAL ACCOUNT ===
 app.post("/api/virtual-account/finalize", async (req, res) => {
   const authHeader = req.headers.authorization;
