@@ -2970,7 +2970,7 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
       return res.status(500).json({ error: "Server configuration error" });
     }
 
-    [cite_start]; // Docs: Initiate Verification -> POST /identity/v2 [cite: 450]
+    // Docs: Initiate Verification -> POST /identity/v2
     // [FIX] Added 'debitAccountNumber' which is REQUIRED
     const response = await makeSafeHavenRequest("/identity/v2", "POST", {
       type: "BVN",
