@@ -3132,6 +3132,23 @@ app.post("/api/virtual-account/initiate", async (req, res) => {
 //   }
 // });
 
+// ==========================================
+// === UNIFIED: CREATE ACCOUNT (DIRECT) ===
+// ==========================================
+
+// Helper to format phone number to +234 format (Required by Safe Haven)
+function formatPhoneNumber(phone) {
+  if (!phone) return "+2348000000000";
+  // Remove spaces and non-digits
+  let clean = phone.replace(/\D/g, "");
+  // Replace leading '0' with '234'
+  if (clean.startsWith("0")) {
+    clean = "234" + clean.substring(1);
+  }
+  // Ensure it starts with +
+  return "+" + clean;
+}
+
 app.post("/api/virtual-account/finalize", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -3149,39 +3166,10 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
         .json({ error: "Missing required fields (Identity ID, OTP, or BVN)" });
     }
 
-    // 2. Validate OTP with Safe Haven
-    console.log(`Verifying OTP for User ${userId}...`);
-    const validateRes = await makeSafeHavenRequest(
-      "/identity/v2/validate",
-      "POST",
-      {
-        identityId: identityId,
-        type: "BVN",
-        otp: otp.trim(),
-      }
-    );
-
-    const valData = validateRes.data;
-
-    // Check validation success
-    // Note: We accept statusCode 200 OR explicit status "SUCCESS"
-    const isVerified =
-      valData.statusCode == 200 ||
-      valData.data?.status === "SUCCESS" ||
-      valData.message?.toLowerCase().includes("successfully");
-
-    if (!isVerified) {
-      console.error("OTP Verification Failed:", JSON.stringify(valData));
-      return res.status(400).json({
-        error: valData.message || "Invalid OTP. Please try again.",
-        details: valData,
-      });
-    }
-
-    // 3. Create Sub-Account (Idempotency check)
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
+    // 2. Idempotency Check
     if (userData.virtualAccount?.accountNumber) {
       return res.json({
         success: true,
@@ -3190,19 +3178,24 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
       });
     }
 
-    // 4. Call Safe Haven Create Sub-Account
-    // We use identityType: 'vID' because we just successfully validated it above
+    // 3. Prepare Payload for Direct Creation
+    // We use identityType: 'BVN' and pass the OTP directly.
+    // This allows Safe Haven to validate & create in one atomic step.
     const createPayload = {
-      phoneNumber: userData.phoneNumber || "+2348000000000",
+      phoneNumber: formatPhoneNumber(userData.phoneNumber),
       emailAddress:
         userData.email || `user${userId.substring(0, 5)}@highestdata.com`,
-      externalReference: `SUB-${userId}-${Date.now()}`,
-      identityType: "vID",
+      externalReference: `SUB-${userId}-${Date.now()}`, // Ensure unique ref
+      identityType: "BVN",
       identityId: identityId,
+      otp: otp.trim(),
       autoSweep: false,
+      // callbackUrl: "..." // Optional, defaults to dashboard setting
     };
 
-    console.log(`Creating Account for User ${userId}...`);
+    console.log(`Creating Account for User ${userId} (Direct Mode)...`);
+
+    // Call Create Endpoint directly
     const createRes = await makeSafeHavenRequest(
       "/accounts/v2/subaccount",
       "POST",
@@ -3210,7 +3203,11 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
     );
     const createData = createRes.data;
 
-    if (createData.statusCode == 200 && createData.data?.accountNumber) {
+    // 4. Handle Response
+    if (
+      (createData.statusCode == 200 || createData.statusCode == 201) &&
+      createData.data?.accountNumber
+    ) {
       const accountData = createData.data;
 
       const savedAccount = {
@@ -3222,7 +3219,7 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
         createdDate: new Date().toISOString(),
       };
 
-      // 5. Save to Firestore
+      // Save to Firestore
       await db
         .collection("users")
         .doc(userId)
@@ -3239,8 +3236,11 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
       });
     } else {
       console.error("Account Creation Failed:", JSON.stringify(createData));
+      // Return the specific error from Safe Haven (e.g., "Invalid OTP", "Account limit reached")
       return res.status(400).json({
-        error: createData.message || "Failed to generate account number",
+        error:
+          createData.message ||
+          "Unable to create account. Please check OTP and try again.",
         details: createData,
       });
     }
