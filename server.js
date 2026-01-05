@@ -2592,169 +2592,6 @@ app.post("/api/funding/verify", async (req, res) => {
   }
 });
 
-// ==========================================
-// === VIRTUAL ACCOUNT (SUB-ACCOUNT) APIs ===
-// ==========================================
-
-// 1. Initiate Identity Verification (Step 1: Send OTP)
-app.post("/api/virtual-account/initiate", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  try {
-    await verifyFirebaseToken(idToken);
-    const { bvn } = req.body; // User provides BVN
-
-    if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({ error: "Valid 11-digit BVN is required" });
-    }
-
-    // Call Safe Haven Identity Init
-    // Docs: POST /identity/v2
-    const response = await makeSafeHavenRequest("/identity/v2", "POST", {
-      type: "BVN",
-      number: bvn,
-      async: false, // We want immediate response if possible
-    });
-
-    const data = response.data;
-    if (data.statusCode === 200 || data.data?._id) {
-      // Return the identityId (_id) needed for the next step
-      res.json({
-        success: true,
-        message: "OTP sent to BVN phone number",
-        identityId: data.data._id,
-      });
-    } else {
-      res.status(400).json({ error: data.message || "Verification failed" });
-    }
-  } catch (error) {
-    console.error("Identity Init Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 2. Validate Identity Verification (Step 2: Verify OTP)
-app.post("/api/virtual-account/validate", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  try {
-    await verifyFirebaseToken(idToken);
-    const { identityId, otp } = req.body;
-
-    if (!identityId || !otp) {
-      return res.status(400).json({ error: "Missing Identity ID or OTP" });
-    }
-
-    // Call Safe Haven Identity Validate
-    // Docs: POST /identity/v2/validate
-    const response = await makeSafeHavenRequest(
-      "/identity/v2/validate",
-      "POST",
-      {
-        identityId: identityId,
-        type: "BVN",
-        otp: otp,
-      }
-    );
-
-    const data = response.data;
-
-    if (data.statusCode === 200 || data.data?.status === "SUCCESS") {
-      res.json({
-        success: true,
-        message: "Identity verified successfully",
-        identityId: data.data._id, // Return ID again just in case
-      });
-    } else {
-      res.status(400).json({ error: data.message || "Invalid OTP" });
-    }
-  } catch (error) {
-    console.error("Identity Validate Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. Create Sub-Account (Step 3: Create & Save to DB)
-app.post("/api/virtual-account/create", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
-
-  try {
-    const userId = await verifyFirebaseToken(idToken);
-    const { identityId, bvn } = req.body; // identityId from Step 2
-
-    // Get User Profile for Email/Phone
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
-
-    // Check if already exists (Idempotency)
-    if (userData.virtualAccount?.accountNumber) {
-      return res.json({ success: true, account: userData.virtualAccount });
-    }
-
-    // Prepare Payload
-    // Docs: POST /accounts/v2/subaccount
-    const payload = {
-      phoneNumber: userData.phoneNumber || "+2348000000000",
-      emailAddress: userData.email,
-      externalReference: `SUB-${userId}`,
-      identityType: "vID", // We use vID because we just verified them via Safe Haven
-      identityId: identityId,
-      autoSweep: false, // Static account, money stays there until we sweep/webhook handles it?
-      // Actually, Safe Haven Sub-accounts usually hold the money.
-      // The webhook notifies us, we credit user DB.
-    };
-
-    const response = await makeSafeHavenRequest(
-      "/accounts/v2/subaccount",
-      "POST",
-      payload
-    );
-    const data = response.data;
-
-    if (data.statusCode === 200 && data.data?.accountNumber) {
-      const accountData = data.data;
-
-      const savedAccount = {
-        accountNumber: accountData.accountNumber,
-        accountName: accountData.accountName,
-        bankName: "Safe Haven MFB", // Provider Name
-        bankCode: "090286",
-        safeHavenId: accountData._id,
-      };
-
-      // SAVE TO FIRESTORE
-      await db.collection("users").doc(userId).update({
-        virtualAccount: savedAccount,
-        bvnVerified: true, // Mark user as verified
-        bvn: bvn, // Optional: Store masked BVN if needed
-      });
-
-      res.json({
-        success: true,
-        message: "Virtual account created successfully",
-        account: savedAccount,
-      });
-    } else {
-      console.error("Create SubAccount Failed:", JSON.stringify(data));
-      res
-        .status(400)
-        .json({ error: data.message || "Failed to create account" });
-    }
-  } catch (error) {
-    console.error("Create Account Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // WITHDRAWAL
 
 app.get("/api/banks", async (req, res) => {
@@ -3106,33 +2943,205 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 //     console.error("Webhook Logic Error:", err);
 //   }
 // };
+// ==========================================
+// === VIRTUAL ACCOUNT (SUB-ACCOUNT) APIs ===
+// ==========================================
+
+// 1. Initiate Identity Verification (Step 1: Send OTP)
+app.post("/api/virtual-account/initiate", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    await verifyFirebaseToken(idToken);
+    const { bvn } = req.body;
+
+    if (!bvn || bvn.length !== 11) {
+      return res.status(400).json({ error: "Valid 11-digit BVN is required" });
+    }
+
+    // Docs: Initiate Verification -> POST /identity/v2
+    const response = await makeSafeHavenRequest("/identity/v2", "POST", {
+      type: "BVN",
+      number: bvn,
+      async: false, // Request immediate response
+    });
+
+    const data = response.data;
+
+    // Check for success (statusCode 200 and data._id exists)
+    if (
+      (data.statusCode === 200 || data.status === "success") &&
+      data.data?._id
+    ) {
+      res.json({
+        success: true,
+        message: "OTP sent to BVN phone number",
+        identityId: data.data._id,
+      });
+    } else {
+      res.status(400).json({
+        error: data.message || "Verification initiation failed",
+        details: data,
+      });
+    }
+  } catch (error) {
+    console.error("Identity Init Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Validate Identity Verification (Step 2: Verify OTP)
+app.post("/api/virtual-account/validate", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    await verifyFirebaseToken(idToken);
+    const { identityId, otp } = req.body;
+
+    if (!identityId || !otp) {
+      return res.status(400).json({ error: "Missing Identity ID or OTP" });
+    }
+
+    // Docs: Validate Verification -> POST /identity/v2/validate
+    const response = await makeSafeHavenRequest(
+      "/identity/v2/validate",
+      "POST",
+      {
+        identityId: identityId,
+        type: "BVN",
+        otp: otp,
+      }
+    );
+
+    const data = response.data;
+
+    if (data.statusCode === 200 || data.data?.status === "SUCCESS") {
+      res.json({
+        success: true,
+        message: "Identity verified successfully",
+        identityId: data.data._id,
+      });
+    } else {
+      res.status(400).json({
+        error: data.message || "Invalid OTP",
+        details: data,
+      });
+    }
+  } catch (error) {
+    console.error("Identity Validate Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. Create Sub-Account (Step 3: Create & Save)
+app.post("/api/virtual-account/create", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    const userId = await verifyFirebaseToken(idToken);
+    const { identityId, bvn } = req.body;
+
+    // Get User Profile
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    // Idempotency: Return existing if available
+    if (userData.virtualAccount?.accountNumber) {
+      return res.json({ success: true, account: userData.virtualAccount });
+    }
+
+    // Docs: Create Sub Account (Individual) -> POST /accounts/v2/subaccount
+    // We use identityType: 'vID' because we have already validated the identity in the previous step
+    const payload = {
+      phoneNumber: userData.phoneNumber || "+2348000000000",
+      emailAddress:
+        userData.email || `user${userId.substring(0, 5)}@highestdata.com`,
+      externalReference: `SUB-${userId}-${Date.now()}`,
+      identityType: "vID",
+      identityId: identityId,
+      autoSweep: false, // Static account
+    };
+
+    const response = await makeSafeHavenRequest(
+      "/accounts/v2/subaccount",
+      "POST",
+      payload
+    );
+    const data = response.data;
+
+    if (data.statusCode === 200 && data.data?.accountNumber) {
+      const accountData = data.data;
+
+      const savedAccount = {
+        accountNumber: accountData.accountNumber,
+        accountName: accountData.accountName,
+        bankName: "Safe Haven MFB",
+        bankCode: "090286",
+        safeHavenId: accountData._id,
+        createdDate: new Date().toISOString(),
+      };
+
+      // Save to Firestore
+      await db
+        .collection("users")
+        .doc(userId)
+        .update({
+          virtualAccount: savedAccount,
+          bvnVerified: true,
+          bvnMasked: bvn
+            ? `${bvn.substring(0, 4)}****${bvn.substring(8)}`
+            : null,
+        });
+
+      res.json({
+        success: true,
+        message: "Virtual account created successfully",
+        account: savedAccount,
+      });
+    } else {
+      console.error("Create SubAccount Failed:", JSON.stringify(data));
+      res
+        .status(400)
+        .json({ error: data.message || "Failed to create account" });
+    }
+  } catch (error) {
+    console.error("Create Account Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ==========================================
-// UPDATED UNIFIED WEBHOOK HANDLER
+// === UPDATED WEBHOOK HANDLER ===
 // ==========================================
+
 const handleWebhook = async (req, res) => {
   // 1. ACKNOWLEDGE IMMEDIATELY
   res.sendStatus(200);
 
   const payload = req.body;
-  // console.log("SH Webhook:", JSON.stringify(payload)); // Comment out in prod to reduce logs
+  // console.log("SH Webhook Payload:", JSON.stringify(payload));
 
   try {
-    // === A. FUNDING (Virtual Account Credit) ===
+    // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
     if (payload.type === "virtualAccount.transfer") {
       const data = payload.data;
 
-      // Fields based on SUB ACCOUNT.txt webhook sample
+      // Extract details from "virtualAccount.transfer" payload
       const ref = data.paymentReference;
       const creditAmount = parseFloat(data.amount);
-      const fee = parseFloat(data.fees || 0);
-      const settledAmount = creditAmount; // Usually you credit the full amount or full minus fee depending on policy.
-      // Note: Safe Haven might deduct fees from the balance.
-      // For now, let's credit exactly what came in.
-
       const accountNumber = data.creditAccountNumber; // The Sub-Account Number
+      const fees = parseFloat(data.fees || 0);
 
-      // 1. Idempotency Check (Check if transaction exists)
+      // 1. Idempotency Check
       const existingTxn = await db.collection("transactions").doc(ref).get();
       if (existingTxn.exists) {
         console.log(`Duplicate Webhook Ref: ${ref}`);
@@ -3140,6 +3149,7 @@ const handleWebhook = async (req, res) => {
       }
 
       // 2. Find User by Virtual Account Number
+      // Ensure you have an index on 'virtualAccount.accountNumber' in Firestore
       const userQuery = await db
         .collection("users")
         .where("virtualAccount.accountNumber", "==", accountNumber)
@@ -3153,9 +3163,10 @@ const handleWebhook = async (req, res) => {
 
         const batch = db.batch();
 
-        // 3. Credit User Wallet
+        // 3. Credit User Wallet (Net Amount usually, or Gross depending on your policy)
+        // Here we credit the full Amount sent by the customer
         batch.update(userDoc.ref, {
-          walletBalance: admin.firestore.FieldValue.increment(settledAmount),
+          walletBalance: admin.firestore.FieldValue.increment(creditAmount),
         });
 
         // 4. Record User Transaction
@@ -3168,37 +3179,42 @@ const handleWebhook = async (req, res) => {
         batch.set(userTxnRef, {
           userId,
           type: "funding",
-          amount: settledAmount,
+          amount: creditAmount,
           reference: ref,
           status: "success",
           description: `Bank Transfer Deposit`,
           source: data.debitAccountName || "Bank Transfer",
-          sourceBank: data.debitBankVerificationNumber || "N/A", // Sometimes comes as bank name
+          sourceBank: data.debitBankVerificationNumber || "N/A",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           externalRef: ref,
         });
 
-        // 5. Global Transaction Record (For Admin)
+        // 5. Global Transaction Record
         batch.set(db.collection("transactions").doc(ref), {
           processed: true,
           type: "funding",
           userId,
-          amount: settledAmount,
-          fee: fee,
+          amount: creditAmount,
+          fee: fees,
           provider: "Safe Haven",
           rawPayload: payload,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
         await batch.commit();
 
-        console.log(`✅ Funded User ${userId} with ₦${settledAmount}`);
+        console.log(`✅ Webhook: Funded User ${userId} with ₦${creditAmount}`);
 
-        // 6. Optional: Send Email
+        // 6. Send Email Notification
         if (userData.email) {
           await sendEmail(
             userData.email,
             "Wallet Funded Successfully",
-            `<p>Your wallet has been credited with <strong>₦${settledAmount.toLocaleString()}</strong> via bank transfer.</p>`
+            `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
+              <h2 style="color: #10b981;">Deposit Confirmed!</h2>
+              <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
+              <p style="color: #666; font-size: 12px;">Ref: ${ref}</p>
+            </div>`
           );
         }
       } else {
@@ -3208,11 +3224,11 @@ const handleWebhook = async (req, res) => {
       }
     }
 
-    // === B. WITHDRAWALS (Outwards) - Keep existing logic ===
+    // === B. WITHDRAWAL UPDATES (Outwards Transfer) ===
     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
       const data = payload.data;
       const ref = data.paymentReference;
-      const status = data.status;
+      const status = data.status; // "Completed", "Successful", "Failed"
 
       if (status === "Created") return;
 
@@ -3239,10 +3255,13 @@ const handleWebhook = async (req, res) => {
                 .doc(userId)
                 .collection("transactions")
                 .doc(ref),
-              { status: "success" }
+              {
+                status: "success",
+              }
             );
-            console.log(`✅ Withdrawal ${ref} SUCCESS via Webhook.`);
+            console.log(`Withdrawal ${ref} SUCCESS via Webhook.`);
           } else if (status === "Failed" || status === "Reversed") {
+            // Refund User
             batch.update(db.collection("users").doc(userId), {
               walletBalance: admin.firestore.FieldValue.increment(
                 docData.totalDeduct
@@ -3259,9 +3278,11 @@ const handleWebhook = async (req, res) => {
                 .doc(userId)
                 .collection("transactions")
                 .doc(ref),
-              { status: "failed" }
+              {
+                status: "failed",
+              }
             );
-            console.log(`❌ Withdrawal ${ref} FAILED via Webhook. Refunded.`);
+            console.log(`Withdrawal ${ref} FAILED via Webhook. Refunded.`);
           }
           await batch.commit();
         }
