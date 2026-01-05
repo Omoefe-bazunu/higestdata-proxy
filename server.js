@@ -3430,25 +3430,200 @@ app.post("/api/virtual-account/finalize", async (req, res) => {
 // === UPDATED WEBHOOK HANDLER ===
 // ==========================================
 
+// const handleWebhook = async (req, res) => {
+//   // 1. ACKNOWLEDGE IMMEDIATELY
+//   res.sendStatus(200);
+
+//   const payload = req.body;
+//   // console.log("SH Webhook Payload:", JSON.stringify(payload));
+
+//   try {
+//     // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
+//     if (payload.type === "virtualAccount.transfer") {
+//       const data = payload.data;
+
+//       // Extract details from "virtualAccount.transfer" payload
+//       const ref = data.paymentReference;
+//       const creditAmount = parseFloat(data.amount);
+//       const accountNumber = data.creditAccountNumber; // The Sub-Account Number
+//       const fees = parseFloat(data.fees || 0);
+
+//       // 1. Idempotency Check
+//       const existingTxn = await db.collection("transactions").doc(ref).get();
+//       if (existingTxn.exists) {
+//         console.log(`Duplicate Webhook Ref: ${ref}`);
+//         return;
+//       }
+
+//       // 2. Find User by Virtual Account Number
+//       // Ensure you have an index on 'virtualAccount.accountNumber' in Firestore
+//       const userQuery = await db
+//         .collection("users")
+//         .where("virtualAccount.accountNumber", "==", accountNumber)
+//         .limit(1)
+//         .get();
+
+//       if (!userQuery.empty) {
+//         const userDoc = userQuery.docs[0];
+//         const userId = userDoc.id;
+//         const userData = userDoc.data();
+
+//         const batch = db.batch();
+
+//         // 3. Credit User Wallet (Net Amount usually, or Gross depending on your policy)
+//         // Here we credit the full Amount sent by the customer
+//         batch.update(userDoc.ref, {
+//           walletBalance: admin.firestore.FieldValue.increment(creditAmount),
+//         });
+
+//         // 4. Record User Transaction
+//         const userTxnRef = db
+//           .collection("users")
+//           .doc(userId)
+//           .collection("transactions")
+//           .doc(ref);
+
+//         batch.set(userTxnRef, {
+//           userId,
+//           type: "funding",
+//           amount: creditAmount,
+//           reference: ref,
+//           status: "success",
+//           description: `Bank Transfer Deposit`,
+//           source: data.debitAccountName || "Bank Transfer",
+//           sourceBank: data.debitBankVerificationNumber || "N/A",
+//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//           externalRef: ref,
+//         });
+
+//         // 5. Global Transaction Record
+//         batch.set(db.collection("transactions").doc(ref), {
+//           processed: true,
+//           type: "funding",
+//           userId,
+//           amount: creditAmount,
+//           fee: fees,
+//           provider: "Safe Haven",
+//           rawPayload: payload,
+//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//         });
+
+//         await batch.commit();
+
+//         console.log(`✅ Webhook: Funded User ${userId} with ₦${creditAmount}`);
+
+//         // 6. Send Email Notification
+//         if (userData.email) {
+//           await sendEmail(
+//             userData.email,
+//             "Wallet Funded Successfully",
+//             `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
+//               <h2 style="color: #10b981;">Deposit Confirmed!</h2>
+//               <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
+//               <p style="color: #666; font-size: 12px;">Ref: ${ref}</p>
+//             </div>`
+//           );
+//         }
+//       } else {
+//         console.error(
+//           `⚠️ Webhook Error: No user found for account ${accountNumber}`
+//         );
+//       }
+//     }
+
+//     // === B. WITHDRAWAL UPDATES (Outwards Transfer) ===
+//     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
+//       const data = payload.data;
+//       const ref = data.paymentReference;
+//       const status = data.status; // "Completed", "Successful", "Failed"
+
+//       if (status === "Created") return;
+
+//       const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
+
+//       if (reqDoc.exists) {
+//         const docData = reqDoc.data();
+//         const userId = docData.userId;
+
+//         if (
+//           docData.status === "processing" ||
+//           docData.status === "manual_review"
+//         ) {
+//           const batch = db.batch();
+
+//           if (status === "Completed" || status === "Successful") {
+//             batch.update(reqDoc.ref, {
+//               status: "success",
+//               completedAt: admin.firestore.FieldValue.serverTimestamp(),
+//             });
+//             batch.update(
+//               db
+//                 .collection("users")
+//                 .doc(userId)
+//                 .collection("transactions")
+//                 .doc(ref),
+//               {
+//                 status: "success",
+//               }
+//             );
+//             console.log(`Withdrawal ${ref} SUCCESS via Webhook.`);
+//           } else if (status === "Failed" || status === "Reversed") {
+//             // Refund User
+//             batch.update(db.collection("users").doc(userId), {
+//               walletBalance: admin.firestore.FieldValue.increment(
+//                 docData.totalDeduct
+//               ),
+//             });
+//             batch.update(reqDoc.ref, {
+//               status: "failed",
+//               failedAt: admin.firestore.FieldValue.serverTimestamp(),
+//               reason: data.responseMessage,
+//             });
+//             batch.update(
+//               db
+//                 .collection("users")
+//                 .doc(userId)
+//                 .collection("transactions")
+//                 .doc(ref),
+//               {
+//                 status: "failed",
+//               }
+//             );
+//             console.log(`Withdrawal ${ref} FAILED via Webhook. Refunded.`);
+//           }
+//           await batch.commit();
+//         }
+//       }
+//     }
+//   } catch (err) {
+//     console.error("Webhook Logic Error:", err);
+//   }
+// };
+
 const handleWebhook = async (req, res) => {
   // 1. ACKNOWLEDGE IMMEDIATELY
   res.sendStatus(200);
 
   const payload = req.body;
-  // console.log("SH Webhook Payload:", JSON.stringify(payload));
+  console.log("SH Webhook Payload:", JSON.stringify(payload));
 
   try {
     // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
-    if (payload.type === "virtualAccount.transfer") {
+    // FIX 1: Check for "transfer" type with "Inwards" direction
+    if (payload.type === "transfer" && payload.data?.type === "Inwards") {
       const data = payload.data;
 
-      // Extract details from "virtualAccount.transfer" payload
+      // Extract details from the transfer payload
       const ref = data.paymentReference;
       const creditAmount = parseFloat(data.amount);
-      const accountNumber = data.creditAccountNumber; // The Sub-Account Number
+      const accountNumber = data.creditAccountNumber; // The Sub-Account Number that received funds
       const fees = parseFloat(data.fees || 0);
 
-      // 1. Idempotency Check
+      console.log(
+        `Processing Inwards transfer: ${ref}, Amount: ${creditAmount}, Account: ${accountNumber}`
+      );
+
+      // 1. Idempotency Check - check in transactions collection
       const existingTxn = await db.collection("transactions").doc(ref).get();
       if (existingTxn.exists) {
         console.log(`Duplicate Webhook Ref: ${ref}`);
@@ -3456,7 +3631,6 @@ const handleWebhook = async (req, res) => {
       }
 
       // 2. Find User by Virtual Account Number
-      // Ensure you have an index on 'virtualAccount.accountNumber' in Firestore
       const userQuery = await db
         .collection("users")
         .where("virtualAccount.accountNumber", "==", accountNumber)
@@ -3468,10 +3642,11 @@ const handleWebhook = async (req, res) => {
         const userId = userDoc.id;
         const userData = userDoc.data();
 
+        console.log(`Found user ${userId} for account ${accountNumber}`);
+
         const batch = db.batch();
 
-        // 3. Credit User Wallet (Net Amount usually, or Gross depending on your policy)
-        // Here we credit the full Amount sent by the customer
+        // 3. Credit User Wallet
         batch.update(userDoc.ref, {
           walletBalance: admin.firestore.FieldValue.increment(creditAmount),
         });
@@ -3489,9 +3664,13 @@ const handleWebhook = async (req, res) => {
           amount: creditAmount,
           reference: ref,
           status: "success",
-          description: `Bank Transfer Deposit`,
+          description: `Bank Transfer Deposit from ${
+            data.debitAccountName || "Unknown Sender"
+          }`,
           source: data.debitAccountName || "Bank Transfer",
-          sourceBank: data.debitBankVerificationNumber || "N/A",
+          sourceAccount: data.debitAccountNumber,
+          fees: fees,
+          netAmount: creditAmount - fees,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           externalRef: ref,
         });
@@ -3504,7 +3683,7 @@ const handleWebhook = async (req, res) => {
           amount: creditAmount,
           fee: fees,
           provider: "Safe Haven",
-          rawPayload: payload,
+          accountNumber: accountNumber,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -3520,7 +3699,11 @@ const handleWebhook = async (req, res) => {
             `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
               <h2 style="color: #10b981;">Deposit Confirmed!</h2>
               <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
-              <p style="color: #666; font-size: 12px;">Ref: ${ref}</p>
+              <p><strong>Reference:</strong> ${ref}</p>
+              <p><strong>From:</strong> ${
+                data.debitAccountName || "Bank Transfer"
+              } (${data.debitAccountNumber})</p>
+              <p style="color: #666; font-size: 12px;">Transaction completed at ${new Date().toLocaleString()}</p>
             </div>`
           );
         }
@@ -3528,6 +3711,15 @@ const handleWebhook = async (req, res) => {
         console.error(
           `⚠️ Webhook Error: No user found for account ${accountNumber}`
         );
+
+        // Log unknown account for admin review
+        await db.collection("unknown_transfers").doc(ref).set({
+          accountNumber,
+          amount: creditAmount,
+          reference: ref,
+          payload: payload,
+          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
       }
     }
 
@@ -3535,7 +3727,9 @@ const handleWebhook = async (req, res) => {
     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
       const data = payload.data;
       const ref = data.paymentReference;
-      const status = data.status; // "Completed", "Successful", "Failed"
+      const status = data.status;
+
+      console.log(`Processing Outwards transfer: ${ref}, Status: ${status}`);
 
       if (status === "Created") return;
 
@@ -3566,7 +3760,7 @@ const handleWebhook = async (req, res) => {
                 status: "success",
               }
             );
-            console.log(`Withdrawal ${ref} SUCCESS via Webhook.`);
+            console.log(`✅ Withdrawal ${ref} SUCCESS via Webhook.`);
           } else if (status === "Failed" || status === "Reversed") {
             // Refund User
             batch.update(db.collection("users").doc(userId), {
@@ -3589,11 +3783,19 @@ const handleWebhook = async (req, res) => {
                 status: "failed",
               }
             );
-            console.log(`Withdrawal ${ref} FAILED via Webhook. Refunded.`);
+            console.log(`❌ Withdrawal ${ref} FAILED via Webhook. Refunded.`);
           }
           await batch.commit();
         }
       }
+    }
+
+    // === C. LOG UNHANDLED WEBHOOK TYPES ===
+    else {
+      console.log(
+        `ℹ️ Unhandled webhook type: ${payload.type}, data.type: ${payload.data?.type}`
+      );
+      console.log("Full payload:", JSON.stringify(payload, null, 2));
     }
   } catch (err) {
     console.error("Webhook Logic Error:", err);
