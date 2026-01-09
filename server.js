@@ -2642,6 +2642,149 @@ app.post("/api/resolve-account", async (req, res) => {
   }
 });
 
+// // ==========================================
+// // WITHDRAWAL PROCESS (Optimized)
+// // ==========================================
+// app.post("/api/withdrawal/process", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
+
+//   try {
+//     const userId = await verifyFirebaseToken(idToken);
+//     const { amount, bankCode, accountNumber, accountName } = req.body;
+
+//     const withdrawalAmount = parseFloat(amount);
+//     const FEE = 50;
+//     const totalDeduct = withdrawalAmount + FEE;
+
+//     // 1. Validate Balance
+//     const userRef = db.collection("users").doc(userId);
+//     const userDoc = await userRef.get();
+//     if (userDoc.data().walletBalance < totalDeduct) {
+//       return res.status(400).json({ error: "Insufficient balance" });
+//     }
+
+//     // 2. Name Enquiry
+//     const enquiryRes = await makeSafeHavenRequest(
+//       "/transfers/name-enquiry",
+//       "POST",
+//       {
+//         bankCode,
+//         accountNumber,
+//       }
+//     );
+
+//     if (!enquiryRes.data.data?.sessionId) {
+//       return res
+//         .status(400)
+//         .json({ error: "Failed to verify account session" });
+//     }
+//     const sessionId = enquiryRes.data.data.sessionId;
+
+//     const reference = `WDR-${userId.substring(0, 5)}-${Date.now()}`;
+
+//     // 3. Deduct Wallet (Optimistic)
+//     const batch = db.batch();
+//     batch.update(userRef, {
+//       walletBalance: admin.firestore.FieldValue.increment(-totalDeduct),
+//     });
+
+//     // Record Transaction (Processing)
+//     const txnRef = userRef.collection("transactions").doc(reference);
+//     batch.set(txnRef, {
+//       userId,
+//       reference,
+//       type: "debit",
+//       description: `Withdrawal to ${accountName}`,
+//       amount: -totalDeduct,
+//       status: "processing",
+//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//     });
+
+//     const reqRef = db.collection("withdrawalRequests").doc(reference);
+//     batch.set(reqRef, {
+//       userId,
+//       reference,
+//       amount: withdrawalAmount,
+//       totalDeduct,
+//       fee: FEE,
+//       bankCode,
+//       accountNumber,
+//       accountName,
+//       status: "processing",
+//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//     });
+
+//     await batch.commit();
+
+//     // 4. Initiate Transfer
+//     const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+//     const transferPayload = {
+//       nameEnquiryReference: sessionId,
+//       debitAccountNumber: DEBIT_ACCOUNT,
+//       beneficiaryBankCode: bankCode,
+//       beneficiaryAccountNumber: accountNumber,
+//       amount: withdrawalAmount,
+//       saveBeneficiary: false,
+//       narration: `Withdrawal Ref ${reference}`,
+//       paymentReference: reference,
+//     };
+
+//     console.log("Sending Transfer:", JSON.stringify(transferPayload));
+//     const { status, data: transferData } = await makeSafeHavenRequest(
+//       "/transfers",
+//       "POST",
+//       transferPayload
+//     );
+
+//     // === CRITICAL FIX: Check for Immediate Success ===
+//     if (status >= 200 && status < 300 && transferData.data) {
+//       const shStatus = transferData.data.status; // "Completed", "Successful", "Processing"
+
+//       // Save Provider Ref
+//       let updateData = { providerRef: transferData.data.sessionId };
+
+//       // If completed immediately, update DB to success NOW.
+//       if (shStatus === "Completed" || shStatus === "Successful") {
+//         updateData.status = "success";
+//         updateData.completedAt = admin.firestore.FieldValue.serverTimestamp();
+
+//         // Update user transaction too
+//         await txnRef.update({ status: "success" });
+//       }
+
+//       await reqRef.update(updateData);
+
+//       return res.json({
+//         success: true,
+//         message:
+//           shStatus === "Completed"
+//             ? "Transfer successful"
+//             : "Transfer initiated",
+//         data: transferData.data,
+//       });
+//     } else {
+//       // Mark for Manual Review (Do not refund automatically to avoid double spend)
+//       await reqRef.update({
+//         status: "manual_review",
+//         apiError: transferData.message || "Unknown API Error",
+//         apiResponse: JSON.stringify(transferData),
+//       });
+//       return res.json({
+//         success: true,
+//         message: "Transfer queued for processing.",
+//       });
+//     }
+//   } catch (error) {
+//     console.error("Withdrawal Critical Error:", error);
+//     res
+//       .status(500)
+//       .json({ error: "Processing error. Please contact support." });
+//   }
+// });
+
 // ==========================================
 // WITHDRAWAL PROCESS (Optimized)
 // ==========================================
@@ -2659,11 +2802,26 @@ app.post("/api/withdrawal/process", async (req, res) => {
     const FEE = 50;
     const totalDeduct = withdrawalAmount + FEE;
 
-    // 1. Validate Balance
+    // 1. Validate Balance & Get Virtual Account
     const userRef = db.collection("users").doc(userId);
     const userDoc = await userRef.get();
-    if (userDoc.data().walletBalance < totalDeduct) {
+    const userData = userDoc.data();
+
+    if (!userData) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    if (userData.walletBalance < totalDeduct) {
       return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // [UPDATED] Check: Does user have a virtual account to debit from?
+    const debitAccount = userData.virtualAccount?.accountNumber;
+    if (!debitAccount) {
+      return res.status(400).json({
+        error:
+          "Virtual account not found. Please create a funding account first to enable withdrawals.",
+      });
     }
 
     // 2. Name Enquiry
@@ -2720,10 +2878,10 @@ app.post("/api/withdrawal/process", async (req, res) => {
     await batch.commit();
 
     // 4. Initiate Transfer
-    const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
+    // [UPDATED] Use user's virtual account instead of main account
     const transferPayload = {
       nameEnquiryReference: sessionId,
-      debitAccountNumber: DEBIT_ACCOUNT,
+      debitAccountNumber: debitAccount, // <--- CHANGED: Uses User's Sub-Account
       beneficiaryBankCode: bankCode,
       beneficiaryAccountNumber: accountNumber,
       amount: withdrawalAmount,
@@ -2732,14 +2890,18 @@ app.post("/api/withdrawal/process", async (req, res) => {
       paymentReference: reference,
     };
 
-    console.log("Sending Transfer:", JSON.stringify(transferPayload));
+    console.log(
+      "Sending Transfer (Sub-Account):",
+      JSON.stringify(transferPayload)
+    );
+
     const { status, data: transferData } = await makeSafeHavenRequest(
       "/transfers",
       "POST",
       transferPayload
     );
 
-    // === CRITICAL FIX: Check for Immediate Success ===
+    // === Check for Immediate Success ===
     if (status >= 200 && status < 300 && transferData.data) {
       const shStatus = transferData.data.status; // "Completed", "Successful", "Processing"
 
