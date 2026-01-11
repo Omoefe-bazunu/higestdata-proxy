@@ -2645,149 +2645,6 @@ app.post("/api/resolve-account", async (req, res) => {
 // // ==========================================
 // // WITHDRAWAL PROCESS (Optimized)
 // // ==========================================
-// app.post("/api/withdrawal/process", async (req, res) => {
-//   const authHeader = req.headers.authorization;
-//   if (!authHeader?.startsWith("Bearer "))
-//     return res.status(401).json({ error: "Unauthorized" });
-//   const idToken = authHeader.split("Bearer ")[1];
-
-//   try {
-//     const userId = await verifyFirebaseToken(idToken);
-//     const { amount, bankCode, accountNumber, accountName } = req.body;
-
-//     const withdrawalAmount = parseFloat(amount);
-//     const FEE = 50;
-//     const totalDeduct = withdrawalAmount + FEE;
-
-//     // 1. Validate Balance
-//     const userRef = db.collection("users").doc(userId);
-//     const userDoc = await userRef.get();
-//     if (userDoc.data().walletBalance < totalDeduct) {
-//       return res.status(400).json({ error: "Insufficient balance" });
-//     }
-
-//     // 2. Name Enquiry
-//     const enquiryRes = await makeSafeHavenRequest(
-//       "/transfers/name-enquiry",
-//       "POST",
-//       {
-//         bankCode,
-//         accountNumber,
-//       }
-//     );
-
-//     if (!enquiryRes.data.data?.sessionId) {
-//       return res
-//         .status(400)
-//         .json({ error: "Failed to verify account session" });
-//     }
-//     const sessionId = enquiryRes.data.data.sessionId;
-
-//     const reference = `WDR-${userId.substring(0, 5)}-${Date.now()}`;
-
-//     // 3. Deduct Wallet (Optimistic)
-//     const batch = db.batch();
-//     batch.update(userRef, {
-//       walletBalance: admin.firestore.FieldValue.increment(-totalDeduct),
-//     });
-
-//     // Record Transaction (Processing)
-//     const txnRef = userRef.collection("transactions").doc(reference);
-//     batch.set(txnRef, {
-//       userId,
-//       reference,
-//       type: "debit",
-//       description: `Withdrawal to ${accountName}`,
-//       amount: -totalDeduct,
-//       status: "processing",
-//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-//     });
-
-//     const reqRef = db.collection("withdrawalRequests").doc(reference);
-//     batch.set(reqRef, {
-//       userId,
-//       reference,
-//       amount: withdrawalAmount,
-//       totalDeduct,
-//       fee: FEE,
-//       bankCode,
-//       accountNumber,
-//       accountName,
-//       status: "processing",
-//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-//     });
-
-//     await batch.commit();
-
-//     // 4. Initiate Transfer
-//     const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
-//     const transferPayload = {
-//       nameEnquiryReference: sessionId,
-//       debitAccountNumber: DEBIT_ACCOUNT,
-//       beneficiaryBankCode: bankCode,
-//       beneficiaryAccountNumber: accountNumber,
-//       amount: withdrawalAmount,
-//       saveBeneficiary: false,
-//       narration: `Withdrawal Ref ${reference}`,
-//       paymentReference: reference,
-//     };
-
-//     console.log("Sending Transfer:", JSON.stringify(transferPayload));
-//     const { status, data: transferData } = await makeSafeHavenRequest(
-//       "/transfers",
-//       "POST",
-//       transferPayload
-//     );
-
-//     // === CRITICAL FIX: Check for Immediate Success ===
-//     if (status >= 200 && status < 300 && transferData.data) {
-//       const shStatus = transferData.data.status; // "Completed", "Successful", "Processing"
-
-//       // Save Provider Ref
-//       let updateData = { providerRef: transferData.data.sessionId };
-
-//       // If completed immediately, update DB to success NOW.
-//       if (shStatus === "Completed" || shStatus === "Successful") {
-//         updateData.status = "success";
-//         updateData.completedAt = admin.firestore.FieldValue.serverTimestamp();
-
-//         // Update user transaction too
-//         await txnRef.update({ status: "success" });
-//       }
-
-//       await reqRef.update(updateData);
-
-//       return res.json({
-//         success: true,
-//         message:
-//           shStatus === "Completed"
-//             ? "Transfer successful"
-//             : "Transfer initiated",
-//         data: transferData.data,
-//       });
-//     } else {
-//       // Mark for Manual Review (Do not refund automatically to avoid double spend)
-//       await reqRef.update({
-//         status: "manual_review",
-//         apiError: transferData.message || "Unknown API Error",
-//         apiResponse: JSON.stringify(transferData),
-//       });
-//       return res.json({
-//         success: true,
-//         message: "Transfer queued for processing.",
-//       });
-//     }
-//   } catch (error) {
-//     console.error("Withdrawal Critical Error:", error);
-//     res
-//       .status(500)
-//       .json({ error: "Processing error. Please contact support." });
-//   }
-// });
-
-// ==========================================
-// WITHDRAWAL PROCESS (Optimized)
-// ==========================================
 app.post("/api/withdrawal/process", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2802,26 +2659,11 @@ app.post("/api/withdrawal/process", async (req, res) => {
     const FEE = 50;
     const totalDeduct = withdrawalAmount + FEE;
 
-    // 1. Validate Balance & Get Virtual Account
+    // 1. Validate Balance
     const userRef = db.collection("users").doc(userId);
     const userDoc = await userRef.get();
-    const userData = userDoc.data();
-
-    if (!userData) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    if (userData.walletBalance < totalDeduct) {
+    if (userDoc.data().walletBalance < totalDeduct) {
       return res.status(400).json({ error: "Insufficient balance" });
-    }
-
-    // [UPDATED] Check: Does user have a virtual account to debit from?
-    const debitAccount = userData.virtualAccount?.accountNumber;
-    if (!debitAccount) {
-      return res.status(400).json({
-        error:
-          "Virtual account not found. Please create a funding account first to enable withdrawals.",
-      });
     }
 
     // 2. Name Enquiry
@@ -2878,10 +2720,10 @@ app.post("/api/withdrawal/process", async (req, res) => {
     await batch.commit();
 
     // 4. Initiate Transfer
-    // [UPDATED] Use user's virtual account instead of main account
+    const DEBIT_ACCOUNT = process.env.SAFE_HAVEN_MAIN_ACCOUNT;
     const transferPayload = {
       nameEnquiryReference: sessionId,
-      debitAccountNumber: debitAccount, // <--- CHANGED: Uses User's Sub-Account
+      debitAccountNumber: DEBIT_ACCOUNT,
       beneficiaryBankCode: bankCode,
       beneficiaryAccountNumber: accountNumber,
       amount: withdrawalAmount,
@@ -2890,18 +2732,14 @@ app.post("/api/withdrawal/process", async (req, res) => {
       paymentReference: reference,
     };
 
-    console.log(
-      "Sending Transfer (Sub-Account):",
-      JSON.stringify(transferPayload)
-    );
-
+    console.log("Sending Transfer:", JSON.stringify(transferPayload));
     const { status, data: transferData } = await makeSafeHavenRequest(
       "/transfers",
       "POST",
       transferPayload
     );
 
-    // === Check for Immediate Success ===
+    // === CRITICAL FIX: Check for Immediate Success ===
     if (status >= 200 && status < 300 && transferData.data) {
       const shStatus = transferData.data.status; // "Completed", "Successful", "Processing"
 
@@ -2946,6 +2784,168 @@ app.post("/api/withdrawal/process", async (req, res) => {
       .json({ error: "Processing error. Please contact support." });
   }
 });
+
+// // ==========================================
+// // WITHDRAWAL PROCESS (Optimized)
+// // ==========================================
+// app.post("/api/withdrawal/process", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
+
+//   try {
+//     const userId = await verifyFirebaseToken(idToken);
+//     const { amount, bankCode, accountNumber, accountName } = req.body;
+
+//     const withdrawalAmount = parseFloat(amount);
+//     const FEE = 50;
+//     const totalDeduct = withdrawalAmount + FEE;
+
+//     // 1. Validate Balance & Get Virtual Account
+//     const userRef = db.collection("users").doc(userId);
+//     const userDoc = await userRef.get();
+//     const userData = userDoc.data();
+
+//     if (!userData) {
+//       return res.status(404).json({ error: "User not found" });
+//     }
+
+//     if (userData.walletBalance < totalDeduct) {
+//       return res.status(400).json({ error: "Insufficient balance" });
+//     }
+
+//     // [UPDATED] Check: Does user have a virtual account to debit from?
+//     const debitAccount = userData.virtualAccount?.accountNumber;
+//     if (!debitAccount) {
+//       return res.status(400).json({
+//         error:
+//           "Virtual account not found. Please create a funding account first to enable withdrawals.",
+//       });
+//     }
+
+//     // 2. Name Enquiry
+//     const enquiryRes = await makeSafeHavenRequest(
+//       "/transfers/name-enquiry",
+//       "POST",
+//       {
+//         bankCode,
+//         accountNumber,
+//       }
+//     );
+
+//     if (!enquiryRes.data.data?.sessionId) {
+//       return res
+//         .status(400)
+//         .json({ error: "Failed to verify account session" });
+//     }
+//     const sessionId = enquiryRes.data.data.sessionId;
+
+//     const reference = `WDR-${userId.substring(0, 5)}-${Date.now()}`;
+
+//     // 3. Deduct Wallet (Optimistic)
+//     const batch = db.batch();
+//     batch.update(userRef, {
+//       walletBalance: admin.firestore.FieldValue.increment(-totalDeduct),
+//     });
+
+//     // Record Transaction (Processing)
+//     const txnRef = userRef.collection("transactions").doc(reference);
+//     batch.set(txnRef, {
+//       userId,
+//       reference,
+//       type: "debit",
+//       description: `Withdrawal to ${accountName}`,
+//       amount: -totalDeduct,
+//       status: "processing",
+//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//     });
+
+//     const reqRef = db.collection("withdrawalRequests").doc(reference);
+//     batch.set(reqRef, {
+//       userId,
+//       reference,
+//       amount: withdrawalAmount,
+//       totalDeduct,
+//       fee: FEE,
+//       bankCode,
+//       accountNumber,
+//       accountName,
+//       status: "processing",
+//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//     });
+
+//     await batch.commit();
+
+//     // 4. Initiate Transfer
+//     // [UPDATED] Use user's virtual account instead of main account
+//     const transferPayload = {
+//       nameEnquiryReference: sessionId,
+//       debitAccountNumber: debitAccount, // <--- CHANGED: Uses User's Sub-Account
+//       beneficiaryBankCode: bankCode,
+//       beneficiaryAccountNumber: accountNumber,
+//       amount: withdrawalAmount,
+//       saveBeneficiary: false,
+//       narration: `Withdrawal Ref ${reference}`,
+//       paymentReference: reference,
+//     };
+
+//     console.log(
+//       "Sending Transfer (Sub-Account):",
+//       JSON.stringify(transferPayload)
+//     );
+
+//     const { status, data: transferData } = await makeSafeHavenRequest(
+//       "/transfers",
+//       "POST",
+//       transferPayload
+//     );
+
+//     // === Check for Immediate Success ===
+//     if (status >= 200 && status < 300 && transferData.data) {
+//       const shStatus = transferData.data.status; // "Completed", "Successful", "Processing"
+
+//       // Save Provider Ref
+//       let updateData = { providerRef: transferData.data.sessionId };
+
+//       // If completed immediately, update DB to success NOW.
+//       if (shStatus === "Completed" || shStatus === "Successful") {
+//         updateData.status = "success";
+//         updateData.completedAt = admin.firestore.FieldValue.serverTimestamp();
+
+//         // Update user transaction too
+//         await txnRef.update({ status: "success" });
+//       }
+
+//       await reqRef.update(updateData);
+
+//       return res.json({
+//         success: true,
+//         message:
+//           shStatus === "Completed"
+//             ? "Transfer successful"
+//             : "Transfer initiated",
+//         data: transferData.data,
+//       });
+//     } else {
+//       // Mark for Manual Review (Do not refund automatically to avoid double spend)
+//       await reqRef.update({
+//         status: "manual_review",
+//         apiError: transferData.message || "Unknown API Error",
+//         apiResponse: JSON.stringify(transferData),
+//       });
+//       return res.json({
+//         success: true,
+//         message: "Transfer queued for processing.",
+//       });
+//     }
+//   } catch (error) {
+//     console.error("Withdrawal Critical Error:", error);
+//     res
+//       .status(500)
+//       .json({ error: "Processing error. Please contact support." });
+//   }
+// });
 
 // === MANUAL STATUS CHECK ===
 app.post("/api/withdrawal/reverify", async (req, res) => {
@@ -3299,493 +3299,318 @@ app.post("/api/withdrawal/reverify", async (req, res) => {
 // 1. Initiate BVN Verification (Already exists but needs correction)
 // === VIRTUAL ACCOUNT INITIATE VERIFICATION ===
 // === VIRTUAL ACCOUNT INITIATE VERIFICATION ===
-app.post("/api/virtual-account/initiate", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
+// app.post("/api/virtual-account/initiate", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
 
-  try {
-    const userId = await verifyFirebaseToken(idToken);
-    const { bvn } = req.body;
+//   try {
+//     const userId = await verifyFirebaseToken(idToken);
+//     const { bvn } = req.body;
 
-    if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({ error: "Valid 11-digit BVN required" });
-    }
+//     if (!bvn || bvn.length !== 11) {
+//       return res.status(400).json({ error: "Valid 11-digit BVN required" });
+//     }
 
-    // Make Safe Haven Initiate Verification request
-    const { status, data } = await makeSafeHavenRequest(
-      "/identity/v2",
-      "POST",
-      {
-        type: "BVN",
-        number: bvn,
-        debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
-      }
-    );
+//     // Make Safe Haven Initiate Verification request
+//     const { status, data } = await makeSafeHavenRequest(
+//       "/identity/v2",
+//       "POST",
+//       {
+//         type: "BVN",
+//         number: bvn,
+//         debitAccountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT,
+//       }
+//     );
 
-    // Check if request was successful
-    if (data.statusCode === 200) {
-      const identityId = data.data?._id;
+//     // Check if request was successful
+//     if (data.statusCode === 200) {
+//       const identityId = data.data?._id;
 
-      if (!identityId) {
-        throw new Error("No identity ID returned from Safe Haven");
-      }
+//       if (!identityId) {
+//         throw new Error("No identity ID returned from Safe Haven");
+//       }
 
-      // SIMPLE FIX: Only include providerResponse if it exists
-      const verificationData = {
-        identityId: identityId,
-        bvn: bvn,
-        identityNumber: data.data?.identityNumber || bvn,
-        status: data.data?.status || "SUCCESS",
-        otpVerified: data.data?.otpVerified || false,
-        otpId: data.data?.otpId || null,
-        initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
+//       // SIMPLE FIX: Only include providerResponse if it exists
+//       const verificationData = {
+//         identityId: identityId,
+//         bvn: bvn,
+//         identityNumber: data.data?.identityNumber || bvn,
+//         status: data.data?.status || "SUCCESS",
+//         otpVerified: data.data?.otpVerified || false,
+//         otpId: data.data?.otpId || null,
+//         initiatedAt: admin.firestore.FieldValue.serverTimestamp(),
+//       };
 
-      // ADD ONLY IF IT EXISTS
-      if (data.data?.providerResponse) {
-        verificationData.providerResponse = data.data.providerResponse;
-      }
+//       // ADD ONLY IF IT EXISTS
+//       if (data.data?.providerResponse) {
+//         verificationData.providerResponse = data.data.providerResponse;
+//       }
 
-      // Save verification data to user document
-      await db.collection("users").doc(userId).update({
-        bvnVerification: verificationData,
-      });
+//       // Save verification data to user document
+//       await db.collection("users").doc(userId).update({
+//         bvnVerification: verificationData,
+//       });
 
-      const otpVerified = data.data?.otpVerified || false;
+//       const otpVerified = data.data?.otpVerified || false;
 
-      res.json({
-        success: true,
-        identityId: identityId,
-        otpVerified: otpVerified,
-        message: otpVerified
-          ? "BVN verified successfully"
-          : "OTP sent to your BVN phone number",
-      });
-    } else {
-      res.status(400).json({
-        success: false,
-        error: data.message || "Failed to initiate verification",
-      });
-    }
-  } catch (error) {
-    console.error("Initiate verification error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
-  }
-});
+//       res.json({
+//         success: true,
+//         identityId: identityId,
+//         otpVerified: otpVerified,
+//         message: otpVerified
+//           ? "BVN verified successfully"
+//           : "OTP sent to your BVN phone number",
+//       });
+//     } else {
+//       res.status(400).json({
+//         success: false,
+//         error: data.message || "Failed to initiate verification",
+//       });
+//     }
+//   } catch (error) {
+//     console.error("Initiate verification error:", error);
+//     res.status(500).json({
+//       success: false,
+//       error: error.message,
+//     });
+//   }
+// });
 
-// === VALIDATE OTP AND CREATE VIRTUAL ACCOUNT ===
-app.post("/api/virtual-account/finalize", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "Unauthorized" });
-  const idToken = authHeader.split("Bearer ")[1];
+// // === VALIDATE OTP AND CREATE VIRTUAL ACCOUNT ===
+// app.post("/api/virtual-account/finalize", async (req, res) => {
+//   const authHeader = req.headers.authorization;
+//   if (!authHeader?.startsWith("Bearer "))
+//     return res.status(401).json({ error: "Unauthorized" });
+//   const idToken = authHeader.split("Bearer ")[1];
 
-  try {
-    const userId = await verifyFirebaseToken(idToken);
-    const { identityId, otp, bvn } = req.body;
+//   try {
+//     const userId = await verifyFirebaseToken(idToken);
+//     const { identityId, otp, bvn } = req.body;
 
-    if (!identityId || !bvn) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
+//     if (!identityId || !bvn) {
+//       return res.status(400).json({ error: "Missing required fields" });
+//     }
 
-    console.log(
-      "Finalizing verification for user:",
-      userId,
-      "identityId:",
-      identityId
-    );
+//     console.log(
+//       "Finalizing verification for user:",
+//       userId,
+//       "identityId:",
+//       identityId
+//     );
 
-    // Get user data and verification session
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data();
+//     // Get user data and verification session
+//     const userDoc = await db.collection("users").doc(userId).get();
+//     const userData = userDoc.data();
 
-    if (
-      !userData.bvnVerification ||
-      userData.bvnVerification.identityId !== identityId
-    ) {
-      return res
-        .status(400)
-        .json({ error: "Verification session expired or invalid" });
-    }
+//     if (
+//       !userData.bvnVerification ||
+//       userData.bvnVerification.identityId !== identityId
+//     ) {
+//       return res
+//         .status(400)
+//         .json({ error: "Verification session expired or invalid" });
+//     }
 
-    const verificationData = userData.bvnVerification;
-    const requiresOtp = !verificationData.otpVerified;
+//     const verificationData = userData.bvnVerification;
+//     const requiresOtp = !verificationData.otpVerified;
 
-    // 1. Validate OTP if required
-    let validatedData = verificationData;
+//     // 1. Validate OTP if required
+//     let validatedData = verificationData;
 
-    if (requiresOtp && otp) {
-      console.log("Validating OTP with Safe Haven...");
-      const validateResponse = await makeSafeHavenRequest(
-        "/identity/v2/validate",
-        "POST",
-        {
-          identityId: identityId,
-          type: "BVN",
-          otp: otp,
-        }
-      );
+//     if (requiresOtp && otp) {
+//       console.log("Validating OTP with Safe Haven...");
+//       const validateResponse = await makeSafeHavenRequest(
+//         "/identity/v2/validate",
+//         "POST",
+//         {
+//           identityId: identityId,
+//           type: "BVN",
+//           otp: otp,
+//         }
+//       );
 
-      console.log(
-        "Safe Haven validate response:",
-        JSON.stringify(validateResponse.data, null, 2)
-      );
+//       console.log(
+//         "Safe Haven validate response:",
+//         JSON.stringify(validateResponse.data, null, 2)
+//       );
 
-      if (
-        validateResponse.data.statusCode !== 200 ||
-        !validateResponse.data.data
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: validateResponse.data.message || "Invalid OTP",
-          details: "Please check the OTP and try again",
-        });
-      }
+//       if (
+//         validateResponse.data.statusCode !== 200 ||
+//         !validateResponse.data.data
+//       ) {
+//         return res.status(400).json({
+//           success: false,
+//           error: validateResponse.data.message || "Invalid OTP",
+//           details: "Please check the OTP and try again",
+//         });
+//       }
 
-      validatedData = validateResponse.data.data;
-    } else if (requiresOtp && !otp) {
-      return res.status(400).json({
-        success: false,
-        error: "OTP is required for verification",
-      });
-    }
+//       validatedData = validateResponse.data.data;
+//     } else if (requiresOtp && !otp) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "OTP is required for verification",
+//       });
+//     }
 
-    // Extract customer information
-    const customerInfo =
-      validatedData.providerResponse || verificationData.providerResponse || {};
-    const customerName =
-      customerInfo.fullName ||
-      `${customerInfo.firstName || ""} ${customerInfo.lastName || ""}`.trim() ||
-      userData.fullName ||
-      "Customer";
+//     // Extract customer information
+//     const customerInfo =
+//       validatedData.providerResponse || verificationData.providerResponse || {};
+//     const customerName =
+//       customerInfo.fullName ||
+//       `${customerInfo.firstName || ""} ${customerInfo.lastName || ""}`.trim() ||
+//       userData.fullName ||
+//       "Customer";
 
-    const verifiedBVN =
-      validatedData.identityNumber || verificationData.identityNumber || bvn;
+//     const verifiedBVN =
+//       validatedData.identityNumber || verificationData.identityNumber || bvn;
 
-    // Get phone number - prefer from customer info, then user data
-    let phoneNumber =
-      customerInfo.phoneNumber1 ||
-      customerInfo.phoneNumber2 ||
-      userData.phoneNumber;
+//     // Get phone number - prefer from customer info, then user data
+//     let phoneNumber =
+//       customerInfo.phoneNumber1 ||
+//       customerInfo.phoneNumber2 ||
+//       userData.phoneNumber;
 
-    // Format phone number for Safe Haven (+234 format)
-    if (phoneNumber) {
-      if (phoneNumber.startsWith("0") && phoneNumber.length === 11) {
-        phoneNumber = "+234" + phoneNumber.substring(1);
-      } else if (phoneNumber.startsWith("234") && phoneNumber.length === 13) {
-        phoneNumber = "+" + phoneNumber;
-      } else if (phoneNumber.length === 10) {
-        phoneNumber = "+234" + phoneNumber;
-      }
-    } else {
-      // Fallback: use a placeholder
-      phoneNumber = "+234" + verifiedBVN.substring(1, 11); // Use BVN digits
-    }
+//     // Format phone number for Safe Haven (+234 format)
+//     if (phoneNumber) {
+//       if (phoneNumber.startsWith("0") && phoneNumber.length === 11) {
+//         phoneNumber = "+234" + phoneNumber.substring(1);
+//       } else if (phoneNumber.startsWith("234") && phoneNumber.length === 13) {
+//         phoneNumber = "+" + phoneNumber;
+//       } else if (phoneNumber.length === 10) {
+//         phoneNumber = "+234" + phoneNumber;
+//       }
+//     } else {
+//       // Fallback: use a placeholder
+//       phoneNumber = "+234" + verifiedBVN.substring(1, 11); // Use BVN digits
+//     }
 
-    // 2. Create virtual account with Safe Haven
-    console.log("Creating virtual account with Safe Haven...");
+//     // 2. Create virtual account with Safe Haven
+//     console.log("Creating virtual account with Safe Haven...");
 
-    const accountResponse = await makeSafeHavenRequest(
-      "/accounts/v2/subaccount",
-      "POST",
-      {
-        phoneNumber: phoneNumber,
-        emailAddress: userData.email,
-        externalReference: `HD_${userId}_${Date.now()}`, // HD = Highest Data
-        identityType: "BVN",
-        identityNumber: verifiedBVN,
-        identityId: identityId,
-        otp: otp || "", // OTP might be required even if already verified
-        callbackUrl:
-          process.env.WEBHOOK_URL ||
-          "https://higestdata-proxy.onrender.com/webhooks",
-        autoSweep: false,
-        // autoSweepDetails: { schedule: 'Instant', accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT }
-      }
-    );
+//     const accountResponse = await makeSafeHavenRequest(
+//       "/accounts/v2/subaccount",
+//       "POST",
+//       {
+//         phoneNumber: phoneNumber,
+//         emailAddress: userData.email,
+//         externalReference: `HD_${userId}_${Date.now()}`, // HD = Highest Data
+//         identityType: "BVN",
+//         identityNumber: verifiedBVN,
+//         identityId: identityId,
+//         otp: otp || "", // OTP might be required even if already verified
+//         callbackUrl:
+//           process.env.WEBHOOK_URL ||
+//           "https://higestdata-proxy.onrender.com/webhooks",
+//         autoSweep: false,
+//         // autoSweepDetails: { schedule: 'Instant', accountNumber: process.env.SAFE_HAVEN_MAIN_ACCOUNT }
+//       }
+//     );
 
-    console.log(
-      "Safe Haven account creation response:",
-      JSON.stringify(accountResponse.data, null, 2)
-    );
+//     console.log(
+//       "Safe Haven account creation response:",
+//       JSON.stringify(accountResponse.data, null, 2)
+//     );
 
-    // Check if account creation was successful
-    if (accountResponse.data.statusCode === 200 && accountResponse.data.data) {
-      const accountData = accountResponse.data.data;
+//     // Check if account creation was successful
+//     if (accountResponse.data.statusCode === 200 && accountResponse.data.data) {
+//       const accountData = accountResponse.data.data;
 
-      // Format account name for display (remove the "/" prefix if present)
-      let displayAccountName = accountData.accountName;
-      if (displayAccountName.includes("/")) {
-        const parts = displayAccountName.split("/");
-        displayAccountName = parts[parts.length - 1].trim();
-      }
+//       // Format account name for display (remove the "/" prefix if present)
+//       let displayAccountName = accountData.accountName;
+//       if (displayAccountName.includes("/")) {
+//         const parts = displayAccountName.split("/");
+//         displayAccountName = parts[parts.length - 1].trim();
+//       }
 
-      // Save virtual account details to user
-      await db
-        .collection("users")
-        .doc(userId)
-        .update({
-          virtualAccount: {
-            accountNumber: accountData.accountNumber,
-            accountName: displayAccountName,
-            fullAccountName: accountData.accountName, // Store the original
-            bankName: "Safe Haven MFB",
-            bankCode: "090286",
-            reference: accountData.externalReference,
-            bvn: verifiedBVN,
-            customerName: customerName,
-            phoneNumber: phoneNumber,
-            email: userData.email,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            safeHavenId: accountData._id,
-          },
-          bvnVerified: true,
-          bvn: verifiedBVN,
-          fullName: customerName,
-          phoneNumber: phoneNumber,
-          // Clear temporary verification data
-          bvnVerification: admin.firestore.FieldValue.delete(),
-        });
+//       // Save virtual account details to user
+//       await db
+//         .collection("users")
+//         .doc(userId)
+//         .update({
+//           virtualAccount: {
+//             accountNumber: accountData.accountNumber,
+//             accountName: displayAccountName,
+//             fullAccountName: accountData.accountName, // Store the original
+//             bankName: "Safe Haven MFB",
+//             bankCode: "090286",
+//             reference: accountData.externalReference,
+//             bvn: verifiedBVN,
+//             customerName: customerName,
+//             phoneNumber: phoneNumber,
+//             email: userData.email,
+//             createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//             safeHavenId: accountData._id,
+//           },
+//           bvnVerified: true,
+//           bvn: verifiedBVN,
+//           fullName: customerName,
+//           phoneNumber: phoneNumber,
+//           // Clear temporary verification data
+//           bvnVerification: admin.firestore.FieldValue.delete(),
+//         });
 
-      res.json({
-        success: true,
-        account: {
-          accountNumber: accountData.accountNumber,
-          accountName: displayAccountName,
-          bankName: "Safe Haven MFB",
-          customerName: customerName,
-        },
-        message: "Virtual account created successfully!",
-        data: accountData,
-      });
-    } else {
-      // Check for specific error messages
-      const errorMsg =
-        accountResponse.data.message || "Failed to create virtual account";
+//       res.json({
+//         success: true,
+//         account: {
+//           accountNumber: accountData.accountNumber,
+//           accountName: displayAccountName,
+//           bankName: "Safe Haven MFB",
+//           customerName: customerName,
+//         },
+//         message: "Virtual account created successfully!",
+//         data: accountData,
+//       });
+//     } else {
+//       // Check for specific error messages
+//       const errorMsg =
+//         accountResponse.data.message || "Failed to create virtual account";
 
-      // If it's an OTP-related error, provide clearer message
-      if (errorMsg.includes("OTP") || errorMsg.includes("otp")) {
-        throw new Error(
-          `OTP validation failed: ${errorMsg}. Please try again.`
-        );
-      }
+//       // If it's an OTP-related error, provide clearer message
+//       if (errorMsg.includes("OTP") || errorMsg.includes("otp")) {
+//         throw new Error(
+//           `OTP validation failed: ${errorMsg}. Please try again.`
+//         );
+//       }
 
-      throw new Error(errorMsg);
-    }
-  } catch (error) {
-    console.error("Finalize error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      details:
-        "Failed to create virtual account. Please try again or contact support.",
-    });
-  }
-});
+//       throw new Error(errorMsg);
+//     }
+//   } catch (error) {
+//     console.error("Finalize error:", error);
+//     res.status(500).json({
+//       success: false,
+//       error: error.message,
+//       details:
+//         "Failed to create virtual account. Please try again or contact support.",
+//     });
+//   }
+// });
 
 // ==========================================
 // === UPDATED WEBHOOK HANDLER ===
 // ==========================================
-
-// const handleWebhook = async (req, res) => {
-//   // 1. ACKNOWLEDGE IMMEDIATELY
-//   res.sendStatus(200);
-
-//   const payload = req.body;
-//   // console.log("SH Webhook Payload:", JSON.stringify(payload));
-
-//   try {
-//     // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
-//     if (payload.type === "virtualAccount.transfer") {
-//       const data = payload.data;
-
-//       // Extract details from "virtualAccount.transfer" payload
-//       const ref = data.paymentReference;
-//       const creditAmount = parseFloat(data.amount);
-//       const accountNumber = data.creditAccountNumber; // The Sub-Account Number
-//       const fees = parseFloat(data.fees || 0);
-
-//       // 1. Idempotency Check
-//       const existingTxn = await db.collection("transactions").doc(ref).get();
-//       if (existingTxn.exists) {
-//         console.log(`Duplicate Webhook Ref: ${ref}`);
-//         return;
-//       }
-
-//       // 2. Find User by Virtual Account Number
-//       // Ensure you have an index on 'virtualAccount.accountNumber' in Firestore
-//       const userQuery = await db
-//         .collection("users")
-//         .where("virtualAccount.accountNumber", "==", accountNumber)
-//         .limit(1)
-//         .get();
-
-//       if (!userQuery.empty) {
-//         const userDoc = userQuery.docs[0];
-//         const userId = userDoc.id;
-//         const userData = userDoc.data();
-
-//         const batch = db.batch();
-
-//         // 3. Credit User Wallet (Net Amount usually, or Gross depending on your policy)
-//         // Here we credit the full Amount sent by the customer
-//         batch.update(userDoc.ref, {
-//           walletBalance: admin.firestore.FieldValue.increment(creditAmount),
-//         });
-
-//         // 4. Record User Transaction
-//         const userTxnRef = db
-//           .collection("users")
-//           .doc(userId)
-//           .collection("transactions")
-//           .doc(ref);
-
-//         batch.set(userTxnRef, {
-//           userId,
-//           type: "funding",
-//           amount: creditAmount,
-//           reference: ref,
-//           status: "success",
-//           description: `Bank Transfer Deposit`,
-//           source: data.debitAccountName || "Bank Transfer",
-//           sourceBank: data.debitBankVerificationNumber || "N/A",
-//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-//           externalRef: ref,
-//         });
-
-//         // 5. Global Transaction Record
-//         batch.set(db.collection("transactions").doc(ref), {
-//           processed: true,
-//           type: "funding",
-//           userId,
-//           amount: creditAmount,
-//           fee: fees,
-//           provider: "Safe Haven",
-//           rawPayload: payload,
-//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-//         });
-
-//         await batch.commit();
-
-//         console.log(`✅ Webhook: Funded User ${userId} with ₦${creditAmount}`);
-
-//         // 6. Send Email Notification
-//         if (userData.email) {
-//           await sendEmail(
-//             userData.email,
-//             "Wallet Funded Successfully",
-//             `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
-//               <h2 style="color: #10b981;">Deposit Confirmed!</h2>
-//               <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
-//               <p style="color: #666; font-size: 12px;">Ref: ${ref}</p>
-//             </div>`
-//           );
-//         }
-//       } else {
-//         console.error(
-//           `⚠️ Webhook Error: No user found for account ${accountNumber}`
-//         );
-//       }
-//     }
-
-//     // === B. WITHDRAWAL UPDATES (Outwards Transfer) ===
-//     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
-//       const data = payload.data;
-//       const ref = data.paymentReference;
-//       const status = data.status; // "Completed", "Successful", "Failed"
-
-//       if (status === "Created") return;
-
-//       const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
-
-//       if (reqDoc.exists) {
-//         const docData = reqDoc.data();
-//         const userId = docData.userId;
-
-//         if (
-//           docData.status === "processing" ||
-//           docData.status === "manual_review"
-//         ) {
-//           const batch = db.batch();
-
-//           if (status === "Completed" || status === "Successful") {
-//             batch.update(reqDoc.ref, {
-//               status: "success",
-//               completedAt: admin.firestore.FieldValue.serverTimestamp(),
-//             });
-//             batch.update(
-//               db
-//                 .collection("users")
-//                 .doc(userId)
-//                 .collection("transactions")
-//                 .doc(ref),
-//               {
-//                 status: "success",
-//               }
-//             );
-//             console.log(`Withdrawal ${ref} SUCCESS via Webhook.`);
-//           } else if (status === "Failed" || status === "Reversed") {
-//             // Refund User
-//             batch.update(db.collection("users").doc(userId), {
-//               walletBalance: admin.firestore.FieldValue.increment(
-//                 docData.totalDeduct
-//               ),
-//             });
-//             batch.update(reqDoc.ref, {
-//               status: "failed",
-//               failedAt: admin.firestore.FieldValue.serverTimestamp(),
-//               reason: data.responseMessage,
-//             });
-//             batch.update(
-//               db
-//                 .collection("users")
-//                 .doc(userId)
-//                 .collection("transactions")
-//                 .doc(ref),
-//               {
-//                 status: "failed",
-//               }
-//             );
-//             console.log(`Withdrawal ${ref} FAILED via Webhook. Refunded.`);
-//           }
-//           await batch.commit();
-//         }
-//       }
-//     }
-//   } catch (err) {
-//     console.error("Webhook Logic Error:", err);
-//   }
-// };
 
 const handleWebhook = async (req, res) => {
   // 1. ACKNOWLEDGE IMMEDIATELY
   res.sendStatus(200);
 
   const payload = req.body;
-  console.log("SH Webhook Payload:", JSON.stringify(payload));
+  // console.log("SH Webhook Payload:", JSON.stringify(payload));
 
   try {
     // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
-    // FIX 1: Check for "transfer" type with "Inwards" direction
-    if (payload.type === "transfer" && payload.data?.type === "Inwards") {
+    if (payload.type === "virtualAccount.transfer") {
       const data = payload.data;
 
-      // Extract details from the transfer payload
+      // Extract details from "virtualAccount.transfer" payload
       const ref = data.paymentReference;
       const creditAmount = parseFloat(data.amount);
-      const accountNumber = data.creditAccountNumber; // The Sub-Account Number that received funds
+      const accountNumber = data.creditAccountNumber; // The Sub-Account Number
       const fees = parseFloat(data.fees || 0);
 
-      console.log(
-        `Processing Inwards transfer: ${ref}, Amount: ${creditAmount}, Account: ${accountNumber}`
-      );
-
-      // 1. Idempotency Check - check in transactions collection
+      // 1. Idempotency Check
       const existingTxn = await db.collection("transactions").doc(ref).get();
       if (existingTxn.exists) {
         console.log(`Duplicate Webhook Ref: ${ref}`);
@@ -3793,6 +3618,7 @@ const handleWebhook = async (req, res) => {
       }
 
       // 2. Find User by Virtual Account Number
+      // Ensure you have an index on 'virtualAccount.accountNumber' in Firestore
       const userQuery = await db
         .collection("users")
         .where("virtualAccount.accountNumber", "==", accountNumber)
@@ -3804,11 +3630,10 @@ const handleWebhook = async (req, res) => {
         const userId = userDoc.id;
         const userData = userDoc.data();
 
-        console.log(`Found user ${userId} for account ${accountNumber}`);
-
         const batch = db.batch();
 
-        // 3. Credit User Wallet
+        // 3. Credit User Wallet (Net Amount usually, or Gross depending on your policy)
+        // Here we credit the full Amount sent by the customer
         batch.update(userDoc.ref, {
           walletBalance: admin.firestore.FieldValue.increment(creditAmount),
         });
@@ -3826,13 +3651,9 @@ const handleWebhook = async (req, res) => {
           amount: creditAmount,
           reference: ref,
           status: "success",
-          description: `Bank Transfer Deposit from ${
-            data.debitAccountName || "Unknown Sender"
-          }`,
+          description: `Bank Transfer Deposit`,
           source: data.debitAccountName || "Bank Transfer",
-          sourceAccount: data.debitAccountNumber,
-          fees: fees,
-          netAmount: creditAmount - fees,
+          sourceBank: data.debitBankVerificationNumber || "N/A",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           externalRef: ref,
         });
@@ -3845,7 +3666,7 @@ const handleWebhook = async (req, res) => {
           amount: creditAmount,
           fee: fees,
           provider: "Safe Haven",
-          accountNumber: accountNumber,
+          rawPayload: payload,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -3861,11 +3682,7 @@ const handleWebhook = async (req, res) => {
             `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
               <h2 style="color: #10b981;">Deposit Confirmed!</h2>
               <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
-              <p><strong>Reference:</strong> ${ref}</p>
-              <p><strong>From:</strong> ${
-                data.debitAccountName || "Bank Transfer"
-              } (${data.debitAccountNumber})</p>
-              <p style="color: #666; font-size: 12px;">Transaction completed at ${new Date().toLocaleString()}</p>
+              <p style="color: #666; font-size: 12px;">Ref: ${ref}</p>
             </div>`
           );
         }
@@ -3873,15 +3690,6 @@ const handleWebhook = async (req, res) => {
         console.error(
           `⚠️ Webhook Error: No user found for account ${accountNumber}`
         );
-
-        // Log unknown account for admin review
-        await db.collection("unknown_transfers").doc(ref).set({
-          accountNumber,
-          amount: creditAmount,
-          reference: ref,
-          payload: payload,
-          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
       }
     }
 
@@ -3889,9 +3697,7 @@ const handleWebhook = async (req, res) => {
     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
       const data = payload.data;
       const ref = data.paymentReference;
-      const status = data.status;
-
-      console.log(`Processing Outwards transfer: ${ref}, Status: ${status}`);
+      const status = data.status; // "Completed", "Successful", "Failed"
 
       if (status === "Created") return;
 
@@ -3922,7 +3728,7 @@ const handleWebhook = async (req, res) => {
                 status: "success",
               }
             );
-            console.log(`✅ Withdrawal ${ref} SUCCESS via Webhook.`);
+            console.log(`Withdrawal ${ref} SUCCESS via Webhook.`);
           } else if (status === "Failed" || status === "Reversed") {
             // Refund User
             batch.update(db.collection("users").doc(userId), {
@@ -3945,24 +3751,218 @@ const handleWebhook = async (req, res) => {
                 status: "failed",
               }
             );
-            console.log(`❌ Withdrawal ${ref} FAILED via Webhook. Refunded.`);
+            console.log(`Withdrawal ${ref} FAILED via Webhook. Refunded.`);
           }
           await batch.commit();
         }
       }
     }
-
-    // === C. LOG UNHANDLED WEBHOOK TYPES ===
-    else {
-      console.log(
-        `ℹ️ Unhandled webhook type: ${payload.type}, data.type: ${payload.data?.type}`
-      );
-      console.log("Full payload:", JSON.stringify(payload, null, 2));
-    }
   } catch (err) {
     console.error("Webhook Logic Error:", err);
   }
 };
+
+// const handleWebhook = async (req, res) => {
+//   // 1. ACKNOWLEDGE IMMEDIATELY
+//   res.sendStatus(200);
+
+//   const payload = req.body;
+//   console.log("SH Webhook Payload:", JSON.stringify(payload));
+
+//   try {
+//     // === A. SUB-ACCOUNT CREDIT (Virtual Account Transfer) ===
+//     // FIX 1: Check for "transfer" type with "Inwards" direction
+//     if (payload.type === "transfer" && payload.data?.type === "Inwards") {
+//       const data = payload.data;
+
+//       // Extract details from the transfer payload
+//       const ref = data.paymentReference;
+//       const creditAmount = parseFloat(data.amount);
+//       const accountNumber = data.creditAccountNumber; // The Sub-Account Number that received funds
+//       const fees = parseFloat(data.fees || 0);
+
+//       console.log(
+//         `Processing Inwards transfer: ${ref}, Amount: ${creditAmount}, Account: ${accountNumber}`
+//       );
+
+//       // 1. Idempotency Check - check in transactions collection
+//       const existingTxn = await db.collection("transactions").doc(ref).get();
+//       if (existingTxn.exists) {
+//         console.log(`Duplicate Webhook Ref: ${ref}`);
+//         return;
+//       }
+
+//       // 2. Find User by Virtual Account Number
+//       const userQuery = await db
+//         .collection("users")
+//         .where("virtualAccount.accountNumber", "==", accountNumber)
+//         .limit(1)
+//         .get();
+
+//       if (!userQuery.empty) {
+//         const userDoc = userQuery.docs[0];
+//         const userId = userDoc.id;
+//         const userData = userDoc.data();
+
+//         console.log(`Found user ${userId} for account ${accountNumber}`);
+
+//         const batch = db.batch();
+
+//         // 3. Credit User Wallet
+//         batch.update(userDoc.ref, {
+//           walletBalance: admin.firestore.FieldValue.increment(creditAmount),
+//         });
+
+//         // 4. Record User Transaction
+//         const userTxnRef = db
+//           .collection("users")
+//           .doc(userId)
+//           .collection("transactions")
+//           .doc(ref);
+
+//         batch.set(userTxnRef, {
+//           userId,
+//           type: "funding",
+//           amount: creditAmount,
+//           reference: ref,
+//           status: "success",
+//           description: `Bank Transfer Deposit from ${
+//             data.debitAccountName || "Unknown Sender"
+//           }`,
+//           source: data.debitAccountName || "Bank Transfer",
+//           sourceAccount: data.debitAccountNumber,
+//           fees: fees,
+//           netAmount: creditAmount - fees,
+//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//           externalRef: ref,
+//         });
+
+//         // 5. Global Transaction Record
+//         batch.set(db.collection("transactions").doc(ref), {
+//           processed: true,
+//           type: "funding",
+//           userId,
+//           amount: creditAmount,
+//           fee: fees,
+//           provider: "Safe Haven",
+//           accountNumber: accountNumber,
+//           createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//         });
+
+//         await batch.commit();
+
+//         console.log(`✅ Webhook: Funded User ${userId} with ₦${creditAmount}`);
+
+//         // 6. Send Email Notification
+//         if (userData.email) {
+//           await sendEmail(
+//             userData.email,
+//             "Wallet Funded Successfully",
+//             `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 8px;">
+//               <h2 style="color: #10b981;">Deposit Confirmed!</h2>
+//               <p>Your wallet has been credited with <strong>₦${creditAmount.toLocaleString()}</strong>.</p>
+//               <p><strong>Reference:</strong> ${ref}</p>
+//               <p><strong>From:</strong> ${
+//                 data.debitAccountName || "Bank Transfer"
+//               } (${data.debitAccountNumber})</p>
+//               <p style="color: #666; font-size: 12px;">Transaction completed at ${new Date().toLocaleString()}</p>
+//             </div>`
+//           );
+//         }
+//       } else {
+//         console.error(
+//           `⚠️ Webhook Error: No user found for account ${accountNumber}`
+//         );
+
+//         // Log unknown account for admin review
+//         await db.collection("unknown_transfers").doc(ref).set({
+//           accountNumber,
+//           amount: creditAmount,
+//           reference: ref,
+//           payload: payload,
+//           receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+//         });
+//       }
+//     }
+
+//     // === B. WITHDRAWAL UPDATES (Outwards Transfer) ===
+//     else if (payload.type === "transfer" && payload.data?.type === "Outwards") {
+//       const data = payload.data;
+//       const ref = data.paymentReference;
+//       const status = data.status;
+
+//       console.log(`Processing Outwards transfer: ${ref}, Status: ${status}`);
+
+//       if (status === "Created") return;
+
+//       const reqDoc = await db.collection("withdrawalRequests").doc(ref).get();
+
+//       if (reqDoc.exists) {
+//         const docData = reqDoc.data();
+//         const userId = docData.userId;
+
+//         if (
+//           docData.status === "processing" ||
+//           docData.status === "manual_review"
+//         ) {
+//           const batch = db.batch();
+
+//           if (status === "Completed" || status === "Successful") {
+//             batch.update(reqDoc.ref, {
+//               status: "success",
+//               completedAt: admin.firestore.FieldValue.serverTimestamp(),
+//             });
+//             batch.update(
+//               db
+//                 .collection("users")
+//                 .doc(userId)
+//                 .collection("transactions")
+//                 .doc(ref),
+//               {
+//                 status: "success",
+//               }
+//             );
+//             console.log(`✅ Withdrawal ${ref} SUCCESS via Webhook.`);
+//           } else if (status === "Failed" || status === "Reversed") {
+//             // Refund User
+//             batch.update(db.collection("users").doc(userId), {
+//               walletBalance: admin.firestore.FieldValue.increment(
+//                 docData.totalDeduct
+//               ),
+//             });
+//             batch.update(reqDoc.ref, {
+//               status: "failed",
+//               failedAt: admin.firestore.FieldValue.serverTimestamp(),
+//               reason: data.responseMessage,
+//             });
+//             batch.update(
+//               db
+//                 .collection("users")
+//                 .doc(userId)
+//                 .collection("transactions")
+//                 .doc(ref),
+//               {
+//                 status: "failed",
+//               }
+//             );
+//             console.log(`❌ Withdrawal ${ref} FAILED via Webhook. Refunded.`);
+//           }
+//           await batch.commit();
+//         }
+//       }
+//     }
+
+//     // === C. LOG UNHANDLED WEBHOOK TYPES ===
+//     else {
+//       console.log(
+//         `ℹ️ Unhandled webhook type: ${payload.type}, data.type: ${payload.data?.type}`
+//       );
+//       console.log("Full payload:", JSON.stringify(payload, null, 2));
+//     }
+//   } catch (err) {
+//     console.error("Webhook Logic Error:", err);
+//   }
+// };
 
 // REGISTER BOTH ROUTES (Singular & Plural)
 app.post("/webhooks", handleWebhook);
